@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from freegsdeep.utils.equilibrium import Equilibrium
+from freegsdeep.freegs.equilibrium import Equilibrium
 from freegs.freegs.jtor import Profile
 from freegs.freegs.critical import find_critical
 from freegs.freegs.plotting import plotEquilibrium
@@ -15,27 +15,27 @@ def solve(
 ) -> None:
     # (1) Initialize psi and apply constraints if any
     if constrain is not None:
-        constrain(eq)
+        constrain(eq, synthetic=True)
     psi = eq.psi()
     iter = 0
     psi_relchange = 10.0
     bndry = 0.0
-    bndry_change = 10.0
+    bndry_change = 10.0e+10
     has_been_limited = False
     ok_to_break = False
     psi_maxchange_iterations, psi_relchange_iterations = [], []
-    eq._profiles(profiles)
+    # eq._profiles(profiles)
     while True:
         # (2) Store last psi and boundary for convergence check
-        psi_last = psi.copy()
+        psi_last = psi.clone()
         bndry_last = bndry
         # (3) Solve GS equation 
         if (iter >= limit_it or has_been_limited) and check_limited:
             eq.check_limited = True
-            eq.solve(psi=psi, psi_bndry=eq.psi_bndry)
+            eq.solve(profiles=profiles, psi=psi, psi_bndry=eq.psi_bndry) 
         else:
             eq.check_limited = False
-            eq.solve(psi=psi, psi_bndry=psi_bndry)
+            eq.solve(profiles=profiles, psi=psi, psi_bndry=psi_bndry) # Here we debug
 
         # (4) Check for limiter and convergence
         if eq.is_limited:
@@ -50,9 +50,9 @@ def solve(
         
         psi = eq.psi()
         psi_change = psi_last - psi
-        psi_maxchange = np.amax(np.abs(psi_change))
+        psi_maxchange = torch.amax(torch.abs(psi_change))
         psi_relchange = psi_maxchange / (
-            np.amax(psi) - np.amin(psi) + 1e-10
+            torch.amax(psi) - torch.amin(psi) + 1e-10
         )
         psi_maxchange_iterations.append(psi_maxchange)
         psi_relchange_iterations.append(psi_relchange)

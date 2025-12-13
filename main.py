@@ -1,20 +1,25 @@
 import os
+import torch
 import freegs.freegs as freegs
 import freegsdeep
-from freegsdeep.utils.equilibrium import Equilibrium
+from freegsdeep.freegs.equilibrium import Equilibrium
 # from freegs.freegs.boundary import freeBoundaryHagenow
-from freegsdeep.utils.boundary import freeBoundaryHagenow
+from freegsdeep.freegs.boundary import freeBoundaryHagenow
+from freegsdeep.freegs.machine import TestTokamak
+from freegsdeep.freegs.control import constrain
+from freegsdeep.freegs.profiles import ConstrainPaxisIp
 import cProfile
 import pstats
 import io
 
-def main():
-    tokamak = freegs.machine.TestTokamakSensor()
+def main(device: str = 'cuda:7'):
+
+    tokamak = TestTokamak()
 
     # Please implement not to reload the model weight
     eq = Equilibrium(
         tokamak=tokamak, Rmin=0.1, Rmax=2.0, Zmin=-1.0, Zmax=1.0, 
-        nx=65, ny=65, boundary=freeBoundaryHagenow, 
+        nx=65, ny=65, boundary=freeBoundaryHagenow, device=device,
         load_path_resi=os.path.join(
             "logs/plain_lbfgs_large_dataset_hard_bdry_251121_195926",
             "model/model_deeponet.pt"
@@ -25,27 +30,28 @@ def main():
         )
         )
 
-    profiles = freegs.jtor.ConstrainPaxisIp(
+    profiles = freegsdeep.freegs.profiles.ConstrainPaxisIp(
         eq, 1e3, 2e5, 2.0
     )
 
-    xpoints = [
-        (1.1, -0.6),
-        (1.1, 0.8)
-        ]
+    xpoints = torch.tensor(
+        [[1.1, -0.6], [1.1, 0.8]], dtype=torch.float64, device=device
+        )
 
-    isoflux = [(1.1, -0.6, 1.1, 0.8)]
+    isoflux = torch.tensor(
+        [[1.1, -0.6, 1.1, 0.8]], dtype=torch.float64, device=device
+        )
 
-    constrain = freegs.control.constrain(xpoints=xpoints, isoflux=isoflux)
+    constraint = constrain(xpoints=xpoints, isoflux=isoflux)
 
     freegsdeep.solve(
-        eq, profiles, constrain, show=True
+        eq, profiles, constraint, show=True
     )
 
 if __name__ == "__main__":
     # profiler = cProfile.Profile()
     # profiler.enable()
-    main()
+    main(device='cuda:0')
     # profiler.disable()
     # with open("profile_output.txt", "w") as f:
     #     ps = pstats.Stats(profiler, stream=f).sort_stats("cumulative")
