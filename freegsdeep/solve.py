@@ -1,9 +1,8 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from freegsdeep.utils.equilibrium import Equilibrium
+from freegsdeep.freegs.equilibrium import Equilibrium
 from freegs.freegs.jtor import Profile
-from freegs.freegs.critical import find_critical
 from freegs.freegs.plotting import plotEquilibrium
 from datetime import datetime
 
@@ -27,7 +26,7 @@ def solve(
     eq._profiles(profiles)
     while True:
         # (2) Store last psi and boundary for convergence check
-        psi_last = psi.copy()
+        psi_last = psi.clone()
         bndry_last = bndry
         # (3) Solve GS equation 
         if (iter >= limit_it or has_been_limited) and check_limited:
@@ -50,9 +49,9 @@ def solve(
         
         psi = eq.psi()
         psi_change = psi_last - psi
-        psi_maxchange = np.amax(np.abs(psi_change))
+        psi_maxchange = torch.amax(torch.abs(psi_change))
         psi_relchange = psi_maxchange / (
-            np.amax(psi) - np.amin(psi) + 1e-10
+            torch.amax(psi) - torch.amin(psi) + 1e-10
         )
         psi_maxchange_iterations.append(psi_maxchange)
         psi_relchange_iterations.append(psi_relchange)

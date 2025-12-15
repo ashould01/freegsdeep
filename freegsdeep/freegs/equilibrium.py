@@ -3,17 +3,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy import interpolate
 from scipy.integrate import romb, cumulative_trapezoid
-from freegs.freegs import critical
-# from freegsdeep.utils import critical
-from freegs.freegs.jtor import Profile
+from freegsdeep.freegs.critical import critical
 from freegs.freegs import polygons
-from freegs.freegs import machine
+from freegsdeep.freegs import machine
+from freegsdeep.freegs.spline import TorchBicubicSpline2D
 from freegs.freegs.gradshafranov import GSsparse
-from freegs.freegs.boundary import freeBoundaryHagenow as freeBoundaryHagenow_numerical
+# from freegs.freegs.boundary import freeBoundaryHagenow as freeBoundaryHagenow_numerical
 import freegs.freegs.multigrid as multigrid
 import matplotlib.pyplot as plt
 
-from freegsdeep.utils.boundary import freeBoundaryHagenow
+from freegsdeep.freegs.boundary import freeBoundaryHagenow
 from freegsdeep.utilstyping import *
 from freegsdeep.model import DeepONet_resi, PINTO
 
@@ -83,7 +82,7 @@ class Equilibrium:
             psi[:, 0] = 0.0
             psi[:, -1] = 0.0
 
-        self._pgreen = tokamak.createPsiGreens(self.R_cpu, self.Z_cpu)
+        self._pgreen = tokamak.createPsiGreens(self.R, self.Z)
         self._current = current
         self.Jtor = None
         
@@ -95,18 +94,20 @@ class Equilibrium:
         ).to(torch.float64).to(device)
         self.call_parameter(load_path_resi, load_path_bdry)
         self._applyBoundary = boundary(
-            self.R_flat, self.Z_flat, self.R_cpu, self.Z_cpu, nx, ny, 
-            self.dR.item(), self.dZ.item(), solver=self._solver_resi,
+            self.R, self.Z, nx, ny, 
+            self.dR.item(), self.dZ.item(), device=self.device, 
+            solver=self._solver_resi,
             )
+        self.critical = critical(device=device)
         # self._applyBoundary = freeBoundaryHagenow_numerical
-        # self.find_critical = critical.find_critical(
-        #     self.R, self.Z, self.boundary_pt, self._solver_resi, self._solver_bdry
-        # )
         self.plasma_psi = psi
-        self._updateBoundaryPsi(psi.detach().cpu().numpy())
-        self.psi_func = interpolate.RectBivariateSpline(
-            self.R_cpu[:, 0], self.Z_cpu[0, :], self.plasma_psi.detach().cpu().numpy()
-        )
+        self._updateBoundaryPsi(psi)
+        # self.psi_func = interpolate.RectBivariateSpline(
+        #     self.R_cpu[:, 0], self.Z_cpu[0, :], self.plasma_psi.detach().cpu().numpy()
+        # )
+        self.psi_func = TorchBicubicSpline2D(
+            self.R[:, 0], self.Z[0, :], self.plasma_psi
+            )
 
         # Debugging for boundary update
         generator = GSsparse(Rmin, Rmax, Zmin, Zmax)
@@ -128,10 +129,10 @@ class Equilibrium:
         self._solver_bdry.eval()
     
     def psi(self):
-        return self.plasma_psi.detach().cpu().numpy() + \
+        return self.plasma_psi + \
             self.tokamak.calcPsiFromGreens(self._pgreen)
     
-    def _profiles(self, profiles: Profile):
+    def _profiles(self, profiles):
         self._profiles = profiles
         
     def _updateBoundaryPsi(
@@ -140,7 +141,7 @@ class Equilibrium:
         if psi is None:
             psi = self.psi()
             
-        opt, xpt = critical.find_critical(self.R_cpu, self.Z_cpu, psi)
+        opt, xpt = self.critical.find_critical(self.R, self.Z, psi)
 
         if opt:
             self.psi_axis = opt[0][2]
@@ -155,7 +156,7 @@ class Equilibrium:
                     Zlimit = Zlimit[limit_args]
                 R = np.asarray(self.R[:, 0])
                 Z = np.asarray(self.Z[0, :])
-                psi_2d = interpolate.RectBivariateSpline(R, Z, psi.T)
+                psi_2d = TorchBicubicSpline2D(R, Z, psi.T)
                 
                 psi_limit_points = np.zeros(len(Rlimit))
                 for i in range(len(Rlimit)):
@@ -179,9 +180,9 @@ class Equilibrium:
                 if xpt:
                     self.psi_xpt = xpt[0][2]
                     self.psi_bndry = self.psi_xpt
-                    self.mask = critical.core_mask(self.R_cpu, self.Z_cpu, psi, opt, xpt)
-                    self.mask_func = interpolate.RectBivariateSpline(
-                        self.R_cpu[:, 0], self.Z_cpu[0, :], self.mask
+                    self.mask = self.critical.core_mask(self.R, self.Z, psi, opt, xpt)
+                    self.mask_func = TorchBicubicSpline2D(
+                        self.R[:, 0], self.Z[0, :], self.mask
                     )
                 else:
                     self.psi_bndry = None
@@ -221,20 +222,18 @@ class Equilibrium:
         if Jtor is None:
             if psi is None:
                 psi = self.psi()
-            Jtor_cpu = self._profiles.Jtor(
-                self.R_cpu, self.Z_cpu, psi, psi_bndry=psi_bndry
+            Jtor = self._profiles.Jtor(
+                self.R, self.Z, psi, psi_bndry=psi_bndry
                 )
         else:
-            Jtor_cpu = Jtor.reshape(self.nx, self.ny).detach().cpu().numpy()
-        Jtor = torch.from_numpy(Jtor_cpu).to(self.device)
+            Jtor = Jtor.reshape(self.nx, self.ny).detach().cpu().numpy()
         R_times_Jtor = self.R * Jtor
-        psi_bdry = torch.from_numpy(self._applyBoundary(
+        psi_bdry = self._applyBoundary(
             R_times_Jtor[None, None, ...],
             self.zero_bdry(
                 self.R_flat.squeeze(), self.Z_flat.squeeze(),
                 R_times_Jtor.reshape(1, self.nx, self.ny)
-                )
-            )).to(self.device).reshape(1, -1, 1)
+                ))
 
         rhs = (-self.mu0 * R_times_Jtor).reshape(1, 1, self.nx, self.ny)
         scaling_rhs = torch.max(rhs) - torch.min(rhs)
@@ -251,13 +250,12 @@ class Equilibrium:
         self.plasma_psi = plasma_psi_resi.reshape(self.nx, self.ny) + \
             plasma_psi_bdry.reshape(self.nx, self.ny)
 
-        self.psi_func = interpolate.RectBivariateSpline(
-            self.R_cpu[:, 0], self.Z_cpu[0, :], self.plasma_psi.detach().cpu().numpy()
+        self.psi_func = TorchBicubicSpline2D(
+            self.R[:, 0], self.Z[0, :], self.plasma_psi
         )
         
         self._updateBoundaryPsi()
-        self._current = romb(romb(Jtor_cpu)) * self.dR * self.dZ
-        self._current_torch = self.romberg(self.romberg(Jtor)) * self.dR * self.dZ
+        self._current = self.romberg(self.romberg(Jtor)) * self.dR * self.dZ
         self.Jtor = Jtor
 
     def _tupleset(self, t: Tuple, d: int, v: Any) -> Tuple:
