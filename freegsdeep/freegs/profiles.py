@@ -1,10 +1,11 @@
-from scipy.integrate import romb, quad
+from scipy.integrate import quad
+# from scipy.integrate import romb
 import numpy as np
 import abc
-from freegsdeep.utilstyping import *
+from freegsdeep.typing import *
 from freegsdeep.freegs.equilibrium import Equilibrium
 from freegsdeep.freegs.critical import critical
-from freegsdeep.freegs.utils import romberg
+from freegsdeep.freegs.utils import romberg as romb
 
 class Profile(abc.ABC):
     def pressure(self, psinorm, out=None):
@@ -104,13 +105,15 @@ class ConstrainPaxisIp(Profile):
         self.Raxis = Raxis
         self.eq = eq
         self.mu0 = 4e-7 * torch.pi
+        self.trapz_matrix = self.eq.trapz_matrix
+        self.dR = self.eq.dR
+        self.dZ = self.eq.dZ
         
     def Jtor(
         self, R: Tensor, Z: Tensor, psi: Tensor, psi_bndry: Optional[float]=None
         ) -> Array:
         self.eq._updateBoundaryPsi(psi)
-        psi_bndry = self.eq.psi_bndry # Here we debug
-        print(psi_bndry)
+        psi_bndry = self.eq.psi_bndry 
 
         # Analyse the equilibrium, finding O- and X-points
         opt, xpt = self.eq.critical.find_critical(R, Z, psi)
@@ -128,9 +131,6 @@ class ConstrainPaxisIp(Profile):
             # No X-points
             psi_bndry = psi[0, 0]
             mask = None
-
-        dR = R[1, 0] - R[0, 0]
-        dZ = Z[0, 1] - Z[0, 0]
 
         # Calculate normalised psi.
         # 0 = magnetic axis
@@ -154,19 +154,32 @@ class ConstrainPaxisIp(Profile):
         shapeintegral *= psi_bndry - psi_axis
 
         # Pressure on axis is
-        #
         # paxis = - (L*Beta0/Raxis) * shapeintegral
-        #
 
         # Integrate current components
-        IR = romberg(romberg(jtorshape * R / self.Raxis)) * dR * dZ
-        I_R = romberg(romberg(jtorshape * self.Raxis / R)) * dR * dZ
+        IR = romb(
+            romb(jtorshape * R / self.Raxis, dx=self.dZ),
+            dx=self.dR
+            )
+        I_R = romb(
+            romb(jtorshape * self.Raxis / R, dx=self.dZ), 
+            dx=self.dR
+            )
+        # IR = torch.sum(
+        #     self.trapz_matrix * jtorshape * R / self.Raxis
+        #     )
+        # I_R = torch.sum(
+        #     self.trapz_matrix * jtorshape * self.Raxis / R
+        #     )
+        # IR = torch.trapz(
+        #     torch.trapz(jtorshape * R / self.Raxis, dx=dZ, dim=1), dx=dR, dim=0
+        # )
+        # I_R = torch.trapz(
+        #     torch.trapz(jtorshape * self.Raxis / R, dx=dZ, dim=1), dx=dR, dim=0
+        # )
 
         # Toroidal plasma current Ip is
-        #
         # Ip = L * (Beta0 * IR + (1-Beta0)*I_R)
-        #    = L*Beta0*(IR - I_R) + L*I_R
-        #
 
         LBeta0 = -self.paxis * self.Raxis / shapeintegral
 

@@ -1,23 +1,16 @@
 import torch
 import torch.nn.functional as F
+from freegsdeep.typing import *
 
-def _central_diff_1d_nonuniform(x, f, dim: int):
-    """
-    Central differences on a nonuniform grid for first derivative along `dim`.
-    f can be (..., N, ...) with N along `dim`.
-    """
-    # move dim to last
+def _central_diff_1d_nonuniform(x: Tensor, f: Tensor, dim: int) -> Tensor:
     f_perm = f.movedim(dim, -1)
     x = x.to(f_perm.device).to(f_perm.dtype)
 
-    N = f_perm.shape[-1]
     df = torch.empty_like(f_perm)
 
-    # interior: (f[i+1]-f[i-1]) / (x[i+1]-x[i-1])
     denom = (x[2:] - x[:-2])
     df[..., 1:-1] = (f_perm[..., 2:] - f_perm[..., :-2]) / denom
 
-    # boundaries: one-sided
     df[..., 0] = (f_perm[..., 1] - f_perm[..., 0]) / (x[1] - x[0])
     df[..., -1] = (f_perm[..., -1] - f_perm[..., -2]) / (x[-1] - x[-2])
 
@@ -31,26 +24,11 @@ class TorchBicubicSpline2D:
     z shape: (Nx, Ny), where x_grid aligns with axis 0 and y_grid aligns with axis 1.
     """
 
-    # Bicubic "Hermite" basis matrix (standard)
-
-    def __init__(self, x_grid, y_grid, z):
+    def __init__(self, x_grid: Tensor, y_grid: Tensor, z: Tensor):
         self.x = torch.as_tensor(x_grid)
         self.y = torch.as_tensor(y_grid)
         self.z = torch.as_tensor(z)
 
-        if self.z.ndim != 2:
-            raise ValueError("z must be 2D with shape (Nx, Ny).")
-        if self.z.shape != (self.x.numel(), self.y.numel()):
-            raise ValueError(f"z shape {self.z.shape} must be (Nx,Ny)=({self.x.numel()},{self.y.numel()}).")
-        if not (torch.all(self.x[1:] > self.x[:-1]) and torch.all(self.y[1:] > self.y[:-1])):
-            raise ValueError("x_grid and y_grid must be strictly increasing.")
-
-        # Use float64 for stability (you can cast later)
-        dtype = torch.float64
-        self.x = self.x.to(dtype)
-        self.y = self.y.to(dtype)
-        self.z = self.z.to(dtype)
-        
         self.device = self.z.device
         self.x = self.x.to(self.device)
         self.y = self.y.to(self.device)
@@ -60,18 +38,13 @@ class TorchBicubicSpline2D:
             [ 0.,  0.,  1.,  0.],
             [-3.,  3., -2., -1.],
             [ 2., -2.,  1.,  1.]],
-            dtype=dtype, device=self.device
+            dtype=torch.float64, device=self.device
         )
 
-        # Precompute node derivatives (simple, stable, no autograd)
-        # fx: derivative w.r.t x (axis 0), fy: w.r.t y (axis 1)
         self.fx = _central_diff_1d_nonuniform(self.x, self.z, dim=0)
         self.fy = _central_diff_1d_nonuniform(self.y, self.z, dim=1)
-
-        # fxy: cross derivative (differentiate fx w.r.t y)
         self.fxy = _central_diff_1d_nonuniform(self.y, self.fx, dim=1)
 
-        # Precompute per-cell coefficient matrices A[i,j] (4x4) for i=0..Nx-2, j=0..Ny-2
         self._build_cell_coeffs()
 
     def _build_cell_coeffs(self):
@@ -110,7 +83,9 @@ class TorchBicubicSpline2D:
         #      [f10, f11, fy10*dy, fy11*dy],
         #      [fx00*dx, fx01*dx, fxy00*dx*dy, fxy01*dx*dy],
         #      [fx10*dx, fx11*dx, fxy10*dx*dy, fxy11*dx*dy]]
-        P = torch.empty((self.z.shape[0]-1, self.z.shape[1]-1, 4, 4), dtype=self.z.dtype, device=self.device)
+        P = torch.empty((
+            self.z.shape[0]-1, self.z.shape[1]-1, 4, 4
+            ), dtype=torch.float64, device=self.device)
 
         P[..., 0, 0] = f00
         P[..., 0, 1] = f01
@@ -161,17 +136,9 @@ class TorchBicubicSpline2D:
             return torch.stack([torch.zeros_like(u), torch.zeros_like(u), 2*torch.ones_like(u), 6*u], dim=-1)
         raise ValueError("order must be 0,1,2")
 
-    def __call__(self, xq, yq, dx=0, dy=0, *, grid=False):
-        """
-        grid=False: xq and yq broadcast pointwise -> output broadcast shape
-        grid=True : xq 1D, yq 1D -> output (len(xq), len(yq)) mesh
-        dx, dy: derivative orders w.r.t physical x and y (0..2)
-        """
-        if dx not in (0,1,2) or dy not in (0,1,2):
-            raise ValueError("Supported derivative orders: 0,1,2 for each of dx,dy.")
-
-        xq = torch.as_tensor(xq, dtype=self.z.dtype, device=self.device)
-        yq = torch.as_tensor(yq, dtype=self.z.dtype, device=self.device)
+    def __call__(self, xq, yq, dx=0, dy=0, grid=False):
+        xq = torch.as_tensor(xq, dtype=torch.float64, device=self.device)
+        yq = torch.as_tensor(yq, dtype=torch.float64, device=self.device)
 
         if grid:
             if xq.ndim != 1 or yq.ndim != 1:

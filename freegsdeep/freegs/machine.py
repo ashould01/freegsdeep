@@ -1,4 +1,4 @@
-from freegsdeep.utilstyping import *
+from freegsdeep.typing import *
 from freegsdeep.freegs.coil import Coil, ShapedCoil
 from scipy.interpolate import interp1d
 

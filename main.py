@@ -8,11 +8,13 @@ from freegsdeep.freegs.profiles import ConstrainPaxisIp
 # from freegs.freegs.boundary import freeBoundaryHagenow
 from freegsdeep.freegs.boundary import freeBoundaryHagenow
 from freegsdeep.freegs.control import constrain
+from datetime import datetime
 import cProfile
 import pstats
 import io
 
-def main(device: str = 'cuda:7'):
+def main(device: str = 'cuda:7', iterationstep: int = 1000):
+    start = datetime.now()
 
     tokamak = TestTokamak()
 
@@ -45,8 +47,15 @@ def main(device: str = 'cuda:7'):
     constraint = constrain(xpoints=xpoints, isoflux=isoflux)
 
     freegsdeep.solve(
-        eq, profiles, constraint, show=True
+        eq, profiles, iteration=iterationstep, constrain=constraint, 
     )
+    print("Solve time: ", datetime.now() - start)
 
 if __name__ == "__main__":
-    main(device='cuda:0')
+    profiler = cProfile.Profile()
+    profiler.enable()
+    main(device='cuda:0', iterationstep=10)
+    profiler.disable()
+    with open("profile_output_bdryupdate.txt", "w") as f:
+        ps = pstats.Stats(profiler, stream=f).sort_stats("cumulative")
+        ps.print_stats()

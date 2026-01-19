@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
-from freegsdeep.utilstyping import *
+from freegsdeep.typing import *
 from freegsdeep.soap import SOAP
 from torch.func import jacrev, vmap
 from pinn.model import PINN

@@ -1,5 +1,5 @@
 import torch
-from freegsdeep.utilstyping import *
+from freegsdeep.typing import *
 import numpy as np
 from scipy import optimize
 from . import critical

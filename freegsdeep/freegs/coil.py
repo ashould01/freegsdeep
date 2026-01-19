@@ -2,7 +2,7 @@ from freegsdeep.freegs.gradshafranov import (
     Greens, GreensBr, GreensBz, dGreens_dR, dGreens_dZ, d2Greens_dR2,
     d2Greens_dZ2, d2Greens_dRdZ,
 )
-from freegsdeep.utilstyping import *
+from freegsdeep.typing import *
 from freegs.freegs import quadrature, polygons
 import torch
 import numbers

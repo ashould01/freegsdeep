@@ -7,7 +7,7 @@ from freegs.freegs.plotting import plotEquilibrium
 from datetime import datetime
 
 def solve(
-    eq: Equilibrium, profiles: Profile, constrain=None, rtol=1e-3, atol=1e-10,
+    eq: Equilibrium, profiles: Profile, iteration=10, constrain=None, rtol=1e-3, atol=1e-10,
     blend=0.0, show=False, axis=None, pause=0.0001, psi_bndry=None, maxits=100,
     convergenceInfo=False, check_limited=False, wait_for_limited=False,
     limit_it=0, 
@@ -24,7 +24,8 @@ def solve(
     ok_to_break = False
     psi_maxchange_iterations, psi_relchange_iterations = [], []
     eq._profiles(profiles)
-    while True:
+    # while True:
+    for i in range(iteration):
         # (2) Store last psi and boundary for convergence check
         psi_last = psi.clone()
         bndry_last = bndry
@@ -114,5 +115,5 @@ def solve(
             # if the model considers constraints, then implement this part
             # constrain(eq)
 
-        psi = eq.psi() * (1.0 - blend) + psi_last * blend
+        # psi = eq.psi() * (1.0 - blend) + psi_last * blend
         iter += 1

@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy import interpolate
-from scipy.integrate import romb, cumulative_trapezoid
+from freegsdeep.freegs.utils import romberg as romb
 from freegsdeep.freegs.critical import critical
 from freegs.freegs import polygons
 from freegsdeep.freegs import machine
@@ -13,7 +13,7 @@ import freegs.freegs.multigrid as multigrid
 import matplotlib.pyplot as plt
 
 from freegsdeep.freegs.boundary import freeBoundaryHagenow
-from freegsdeep.utilstyping import *
+from freegsdeep.typing import *
 from freegsdeep.model import DeepONet_resi, PINTO
 
 class Equilibrium:
@@ -58,8 +58,6 @@ class Equilibrium:
             self.boundary_L, self.boundary_D, self.boundary_R, self.boundary_U
         ], dim=0).reshape(1, -1, 2).to(device)
         
-        self.R_cpu = self.R.clone().cpu().numpy()
-        self.Z_cpu = self.Z.clone().cpu().numpy()
         self.R_flat = self.R.reshape(1, -1, 1)
         self.Z_flat = self.Z.reshape(1, -1, 1)
 
@@ -94,17 +92,14 @@ class Equilibrium:
         ).to(torch.float64).to(device)
         self.call_parameter(load_path_resi, load_path_bdry)
         self._applyBoundary = boundary(
-            self.R, self.Z, nx, ny, 
+            self.R, self.Z, self.boundary_pt.reshape(-1, 2), nx, ny, 
             self.dR.item(), self.dZ.item(), device=self.device, 
             solver=self._solver_resi,
             )
         self.critical = critical(device=device)
-        # self._applyBoundary = freeBoundaryHagenow_numerical
         self.plasma_psi = psi
+
         self._updateBoundaryPsi(psi)
-        # self.psi_func = interpolate.RectBivariateSpline(
-        #     self.R_cpu[:, 0], self.Z_cpu[0, :], self.plasma_psi.detach().cpu().numpy()
-        # )
         self.psi_func = TorchBicubicSpline2D(
             self.R[:, 0], self.Z[0, :], self.plasma_psi
             )
@@ -114,6 +109,15 @@ class Equilibrium:
         self._solver = multigrid.createVcycle(
             nx, ny, generator, nlevels=1, ncycle=1, niter=2, direct=True
         )
+        self.trapz_matrix = torch.zeros(
+            (nx, ny), dtype=torch.float64,
+            device=self.device
+            )
+        self.trapz_matrix[0, 0] = self.trapz_matrix[-1, 0] = \
+            self.trapz_matrix[0, -1] = self.trapz_matrix[-1, -1] = self.dR * self.dZ / 4
+        self.trapz_matrix[0, 1:-1] = self.trapz_matrix[-1, 1:-1] = \
+            self.trapz_matrix[1:-1, 0] = self.trapz_matrix[1:-1, -1] = self.dR * self.dZ / 2
+        self.trapz_matrix[1:-1, 1:-1] = self.dR * self.dZ
     
     def callSolver(self, psi, rhs):
         return self._solver(psi, rhs)
@@ -195,8 +199,8 @@ class Equilibrium:
         nonzero_idx = torch.isclose(
             rhs.abs(), torch.zeros_like(rhs), atol=1e-6
             ).to(torch.float64).to(self.device).squeeze(1)
-        R_grid = torch.from_numpy(self.R_cpu).unsqueeze(0).to(self.device)
-        Z_grid = torch.from_numpy(self.Z_cpu).unsqueeze(0).to(self.device)
+        R_grid = self.R.unsqueeze(0)
+        Z_grid = self.Z.unsqueeze(0)
         R_center = (R_grid * nonzero_idx).sum(dim=1).sum(dim=1) / nonzero_idx.sum(dim=1).sum(dim=1)
         Z_center = (Z_grid * nonzero_idx).sum(dim=1).sum(dim=1) / nonzero_idx.sum(dim=1).sum(dim=1)
         R_center = R_center[:, None]
@@ -228,72 +232,28 @@ class Equilibrium:
         else:
             Jtor = Jtor.reshape(self.nx, self.ny).detach().cpu().numpy()
         R_times_Jtor = self.R * Jtor
-        psi_bdry = self._applyBoundary(
+        plasma_psi_resi, psi_bdry = self._applyBoundary(
             R_times_Jtor[None, None, ...],
             self.zero_bdry(
                 self.R_flat.squeeze(), self.Z_flat.squeeze(),
                 R_times_Jtor.reshape(1, self.nx, self.ny)
                 ))
 
-        rhs = (-self.mu0 * R_times_Jtor).reshape(1, 1, self.nx, self.ny)
-        scaling_rhs = torch.max(rhs) - torch.min(rhs)
         scaling_bdry = torch.max(psi_bdry) - torch.min(psi_bdry)
-
-        plasma_psi_resi = self._solver_resi.forward(
-            self.R_flat, self.Z_flat, rhs / scaling_rhs
-            ) * scaling_rhs
-        zero_bdry = self.zero_bdry(self.R_flat.squeeze(), self.Z_flat.squeeze(), rhs)
-        plasma_psi_resi *= zero_bdry
-        plasma_psi_bdry = self._solver_bdry.forward(
-            self.R_flat, self.Z_flat, self.boundary_pt, psi_bdry / scaling_bdry
-            ) * scaling_bdry
+        with torch.no_grad():
+            plasma_psi_bdry = self._solver_bdry.forward(
+                self.R_flat, self.Z_flat, self.boundary_pt, psi_bdry / scaling_bdry
+                ) * scaling_bdry
         self.plasma_psi = plasma_psi_resi.reshape(self.nx, self.ny) + \
             plasma_psi_bdry.reshape(self.nx, self.ny)
-
         self.psi_func = TorchBicubicSpline2D(
             self.R[:, 0], self.Z[0, :], self.plasma_psi
         )
         
         self._updateBoundaryPsi()
-        self._current = self.romberg(self.romberg(Jtor)) * self.dR * self.dZ
+        self._current = torch.sum(Jtor * self.trapz_matrix) * self.dR * self.dZ
         self.Jtor = Jtor
-
-    def _tupleset(self, t: Tuple, d: int, v: Any) -> Tuple:
-        l = list(t)
-        l[d] = v
-        return tuple(l)
-
-    def romberg(self, y: Tensor, dx=1.0, dim=-1) -> float:
-        nd = len(y.shape)
-        Nsamps = y.shape[dim]
-        Ninterv = Nsamps - 1
-        n = 1
-        k = 0
-        while n < Ninterv:
-            n <<= 1
-            k += 1
-        if n != Ninterv:
-            raise ValueError(f"Number of samples must be 2^k + 1; got at least {n} > {Ninterv}")
-        R = {}
-        h = Ninterv * dx
-        slice_all = (slice(None), ) * nd
-        slice0 = self._tupleset(slice_all, dim, 0)
-        slicem1 = self._tupleset(slice_all, dim, -1)
-        R[(0, 0)] = (y[slice0] + y[slicem1]) * h / 2.0
-        slice_R = slice_all
-        start = stop = step = Ninterv
-        for i in range(1, k + 1):
-            start >>= 1
-            slice_R = self._tupleset(slice_R, dim, slice(start, stop, step))
-            step >>= 1
-            R[(i, 0)] = 0.5 * (R[(i - 1, 0)] + h * y[slice_R].sum(dim))
-            for j in range(1, i + 1):
-                prev = R[(i, j - 1)]
-                R[(i, j)] = prev + (prev - R[(i - 1, j - 1)]) / \
-                    ((1 << (2 * j)) - 1)
-            h /= 2.0
-        
-        return R[(k, k)]
+        print(self.psi_bndry)
 
     def getMachine(self):
         """

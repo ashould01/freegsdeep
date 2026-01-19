@@ -1,2 +1,2 @@
-from .deeponet import DeepONet_resi
-from .pinto import PINTO
+from .model import Integratednet, Integratednet_jax, DeepONet_resi_jax, \
+    PINTO_jax

@@ -1,7 +1,7 @@
 from warnings import warn
 import torch
 from freegsdeep.freegs.spline import TorchBicubicSpline2D
-from freegsdeep.utilstyping import *
+from freegsdeep.typing import *
 
 class critical():
     

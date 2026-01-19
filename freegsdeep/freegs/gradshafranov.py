@@ -1,9 +1,9 @@
 import torch
-from freegsdeep.utilstyping import *
+from freegsdeep.typing import *
 
 mu0 = 4e-7 * torch.pi
 
-def Greens(Rc: float, Zc: float, R: Tensor, Z: Tensor) -> Tensor:
+def Greens(Rc: Tensor, Zc: Tensor, R: Tensor, Z: Tensor) -> Tensor:
     """
     Calculate poloidal flux at (R,Z) due to a unit current
     at (Rc,Zc) using Greens function
@@ -16,7 +16,7 @@ def Greens(Rc: float, Zc: float, R: Tensor, Z: Tensor) -> Tensor:
         b = torch.sqrt(1.0 - k2)
         S = torch.zeros_like(k2, dtype=torch.float64, device=device)
         coef = 0.5 * torch.ones_like(k2, dtype=torch.float64, device=device)
-        for i in range(1, n_iter + 1):
+        for _ in range(n_iter):
             S = S + coef * abs(a ** 2 - b ** 2)
             an = 0.5 * (a + b)
             bn = torch.sqrt(a * b)
@@ -36,11 +36,11 @@ def Greens(Rc: float, Zc: float, R: Tensor, Z: Tensor) -> Tensor:
     k = torch.sqrt(k2)
 
     # Note definition of ellipk, ellipe in scipy is K(k^2), E(k^2)
-    ellipk, ellipke = ellipke(k2)
+    ellipk, ellipe = ellipke(k2)
     return (
         (mu0 / (2.0 * torch.pi))
         * torch.sqrt(R * Rc)
-        * ((2.0 - k2) * ellipk - 2.0 * ellipke)
+        * ((2.0 - k2) * ellipk - 2.0 * ellipe)
         / k
     )
 
