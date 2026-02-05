@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import pickle
 import torch
 import jax
@@ -14,10 +14,14 @@ from freegsnke import (
     GSstaticsolver,
     jtor_update,
 )
+
 import numpy as np
 from freegs.freegs.gradshafranov import Greens
 from freegsdeep.typing import *
-from freegsdeep.model import Integratednet_jax
+from freegsdeep.model import Integratednet_jax, NKDeepONet
+import matplotlib.pyplot as plt
+from datetime import datetime
+
 
 class main():
 
@@ -34,6 +38,8 @@ class main():
         _R_resi = torch.from_numpy(np.linspace(Rmin, Rmax, nR))
         _Z_resi = torch.from_numpy(np.linspace(Zmin, Zmax, nZ))
         _R_resi, _Z_resi = torch.meshgrid(_R_resi, _Z_resi, indexing='ij')
+        self.dRdZ = (_R_resi[1, 0] - _R_resi[0, 0]) * \
+            (_Z_resi[0, 1] - _Z_resi[0, 0])
         _R_resi = _R_resi.reshape(-1)
         _Z_resi = _Z_resi.reshape(-1)
         _R_bdry = torch.from_numpy(np.linspace(Rmin, Rmax, nR))
@@ -62,42 +68,45 @@ class main():
 
         solver_deep = Integratednet_jax(
             Rmin=Rmin, Rmax=Rmax, Zmin=Zmin, Zmax=Zmax, 
-            nx=nR, ny=nZ, key=jax.random.PRNGKey(0)
+            nx=nR, ny=nZ, hidden_dim=15, key=jax.random.PRNGKey(0)
             )
-
-        with open('logs/debug_resi_jax/model/model_39.eqx', 'rb') as f:
+        solver_nk = NKDeepONet(
+            nx=nR, ny=nZ, hidden_dim=15, tokamak_input_len=3, key=jax.random.PRNGKey(0)
+            )
+        with open(
+            'logs/debug_jax_transfinite_integrated/model/model_296.eqx', 'rb'
+            ) as f:
             solver_deep = eqx.tree_deserialise_leaves(f, solver_deep)
+        # with open(
+        #     'logs/debug_jax_nksolver/model/model_1791.eqx', 'rb'
+        #     ) as f:
+        #     solver_nk = eqx.tree_deserialise_leaves(f, solver_nk)
         
         self.solver_deep = vmap(solver_deep, in_axes=(0, 0, None, None, None))
+        # self.solver_nk = vmap(solver_nk, in_axes=(0, 0, None, None))
 
     def F_function(
-        self, solver: GSstaticsolver.NKGSsolver, plasma_psi: Array,
-        tokamak_psi: Array, profiles: Array, neural_hangover: bool
+        self, plasma_psi: Array, tokamak_psi: Array, profiles: Array,
         ) -> Array:
-        solver.freeboundary(plasma_psi, tokamak_psi, profiles)
-        if neural_hangover:
-            rhs = jnp.asarray(solver.rhs)
-            psi_bnd = jnp.zeros((len(self.boundary), 1))
-            psi_bnd = psi_bnd.at[:self.nx, 0].set(rhs[:, 0]) 
-            psi_bnd = psi_bnd.at[self.nx:2*self.nx, 0].set(rhs[:, -1])
-            psi_bnd = psi_bnd.at[2*self.nx:2*self.nx+self.ny-2, 0].set(rhs[0, 1:-1])
-            psi_bnd = psi_bnd.at[2*self.nx+self.ny-2:, 0].set(rhs[-1, 1:-1])
+        self.solver.freeboundary(plasma_psi, tokamak_psi, profiles)
+        rhs = jnp.asarray(self.solver.rhs)
+        psi_bnd = jnp.zeros((len(self.boundary), 1))
+        psi_bnd = psi_bnd.at[:self.nx, 0].set(rhs[:, 0]) 
+        psi_bnd = psi_bnd.at[self.nx:2*self.nx, 0].set(rhs[:, -1])
+        psi_bnd = psi_bnd.at[2*self.nx:2*self.nx+self.ny-2, 0].set(rhs[0, 1:-1])
+        psi_bnd = psi_bnd.at[2*self.nx+self.ny-2:, 0].set(rhs[-1, 1:-1])
 
-            rhs = rhs[None, :, :]
-            residual = plasma_psi - (self.solver_deep(
-                    self.residual[:, 0:1], self.residual[:, 1:2],
-                    rhs, self.boundary, psi_bnd
-            ))
-            residual = np.asarray(residual)
-            return residual
-        else:
-            residual = plasma_psi - solver.linear_GS_solver(
-                solver.psi_boundary, solver.rhs
-            ).reshape(-1)
-            return residual
+        rhs = rhs[None, :, :]
+        residual = plasma_psi - self.solver_deep(
+                self.residual[:, 0:1], self.residual[:, 1:2],
+                rhs, self.boundary, psi_bnd
+        ).reshape(-1)
+        residual = np.asarray(residual)
+        return residual
     
     def simulation(
-        self, alpha_m: float = 1.8, alpha_n: float = 1.2
+        self, image_path: str, 
+        alpha_m: float = 1.8, alpha_n: float = 1.2, picard_handover: float = 0.1,
         ) -> None:
         _R_cpu, _Z_cpu = np.meshgrid(
             np.linspace(self.Rmin, self.Rmax, self.nx),
@@ -131,7 +140,7 @@ class main():
 
         target_relative_tolerance = 1e-6
         max_solving_iterations = 200
-        Picard_handover = 0.1
+        Picard_handover = picard_handover
         max_rel_update_size = 0.15
 
         eq = equilibrium_update.Equilibrium(
@@ -147,18 +156,18 @@ class main():
         profiles = jtor_update.ConstrainPaxisIp(
             eq, paxis, Ip, fvac, alpha_m, alpha_n
         )
-        solver = GSstaticsolver.NKGSsolver(eq)
+        self.solver = GSstaticsolver.NKGSsolver(eq)
         picard_flag = 0
         trial_plasma_psi = np.copy(eq.plasma_psi).reshape(-1)
-        solver.tokamak_psi = eq.tokamak.getPsitokamak(
+        self.solver.tokamak_psi = eq.tokamak.getPsitokamak(
             vgreen=eq._vgreen
             ).reshape(-1)
         control_trial_psi = False
         n_up = 0.0 + 4 * eq.solved
         while (control_trial_psi is False) and (n_up < 10):
             try:
-                res0 = solver.F_function(
-                    trial_plasma_psi, solver.tokamak_psi, profiles
+                res0 = self.solver.F_function(
+                    trial_plasma_psi, self.solver.tokamak_psi, profiles
                     )
                 control_trial_psi = True
             except:
@@ -170,29 +179,30 @@ class main():
             )
             eq.adjust_psi_plasma()
             trial_plasma_psi = np.copy(eq.plasma_psi).reshape(-1)
-            res0 = solver.F_function(
-                trial_plasma_psi, solver.tokamak_psi, profiles
+            res0 = self.solver.F_function(
+                trial_plasma_psi, self.solver.tokamak_psi, profiles
                 )
             
             control_trial_psi = True
         
-        solver.jtor_at_start = profiles.jtor.copy()
-        norm_rel_change = solver.relative_norm_residual(res0, trial_plasma_psi)
-        rel_change, del_psi = solver.relative_del_residual(res0, trial_plasma_psi)
-        solver.relative_change = 1.0 * rel_change
-        solver.norm_rel_change = [1.0 * norm_rel_change]
-
-        solver.best_relative_change = rel_change
-        solver.best_psi = trial_plasma_psi
-        args = [solver.tokamak_psi, profiles]
+        self.solver.jtor_at_start = profiles.jtor.copy()
+        norm_rel_change = self.solver.relative_norm_residual(res0, trial_plasma_psi)
+        rel_change, del_psi = self.solver.relative_del_residual(res0, trial_plasma_psi)
+        self.solver.relative_change = 1.0 * rel_change
+        self.solver.norm_rel_change = [1.0 * norm_rel_change]
+        self.solver.best_relative_change = rel_change
+        self.solver.best_psi = trial_plasma_psi
+        args = [self.solver.tokamak_psi, profiles]
         starting_direction = np.copy(res0)
 
-        solver.initial_rel_residual = 1.0 * rel_change
+        self.solver.initial_rel_residual = 1.0 * rel_change
         iterations = 0
         reduced_failure = False
         while (rel_change > target_relative_tolerance) * (
             iterations < max_solving_iterations
         ) and reduced_failure == False:
+            if iterations == 1:
+                start_time = datetime.now()
             if rel_change > Picard_handover:
                 print("Picard iteration: " + str(iterations))
                 neural_flag = False
@@ -204,56 +214,102 @@ class main():
                     picard_flag = 1
                 update = -1.0 * res0
             else:
-                print("Neural operator iteration: " + str(iterations))
-                picard_flag = False
-                neural_flag = True
-                if picard_flag < min(max_solving_iterations - 1, 3):
-                    res0_2d = res0.reshape(self.nx, self.ny)
-                    res0 = 0.5 * (res0_2d + res0_2d[:, ::-1]).reshape(-1)
-                    picard_flag += 1
-                else:
-                    picard_flag = 1
-                update = -1.0 * res0
-                # print("Newton-Kylrov iteration: " + str(iterations))
+                # print("Neural operator iteration: " + str(iterations))
                 # picard_flag = False
-                # neural_flag = False
-                # solver.nksolver.Arnoldi_iteration(
-                #     x0=trial_plasma_psi.copy(),
-                #     dx=starting_direction.copy(),
-                #     R0=res0.copy(),
-                #     F_function=solver.F_function,
-                #     args=args,
-                #     step_size=2.5,
-                #     scaling_with_n=-1.0,
-                #     target_relative_unexplained_residual= \
-                #         0.3,
-                #     max_n_directions=16,
-                #     clip=10,
+                # neural_flag = True
+                # if picard_flag < min(max_solving_iterations - 1, 3):
+                #     res0_2d = res0.reshape(self.nx, self.ny)
+                #     res0 = 0.5 * (res0_2d + res0_2d[:, ::-1]).reshape(-1)
+                #     picard_flag += 1
+                # else:
+                #     picard_flag = 1
+                # update = -1.0 * res0
+                print("Newton-Kylrov iteration: " + str(iterations))
+                picard_flag = False
+                neural_flag = False
+                self.solver.nksolver.Arnoldi_iteration(
+                    x0=trial_plasma_psi.copy(),
+                    dx=starting_direction.copy(),
+                    R0=res0.copy(),
+                    F_function=self.solver.F_function,
+                    args=args,
+                    step_size=2.5,
+                    scaling_with_n=-1.0,
+                    target_relative_unexplained_residual= \
+                        0.3,
+                    max_n_directions=16,
+                    clip=10,
+                )
+                update = 1.0 * self.solver.nksolver.dx
+                # fig, ax = plt.subplots(1, 2, figsize=(12, 10))
+                
+                # c0 = ax[0].imshow(
+                #     update.reshape(self.nx, self.ny), origin='lower',
+                #     extent=(self.Rmin, self.Rmax, self.Zmin, self.Zmax),
                 # )
-                # update = 1.0 * solver.nksolver.dx
+                # fig.colorbar(c0, ax=ax[0])
+                # update_neural = self.solver_nk(
+                #     self.residual[:, 0:1], self.residual[:, 1:2],
+                #     jnp.concatenate([
+                #         jnp.asarray(trial_plasma_psi.reshape(1, self.nx, self.ny)),
+                #         jnp.asarray(self.solver.tokamak_psi.reshape(1, self.nx, self.ny))
+                #         ], axis=0),
+                #     jnp.asarray([8e3, 6e5, 0.5])
+                # )
+                # c1 = ax[1].imshow(update_neural.reshape(self.nx, self.ny), origin='lower',
+                #     extent=(self.Rmin, self.Rmax, self.Zmin, self.Zmax),
+                # )
+                # fig.colorbar(c1, ax=ax[1])
+                # save_path = 'image/MAST-U/simulation_update'
+                # os.makedirs(save_path, exist_ok=True)
+                # fig.savefig(save_path + '/iteration_' + str(iterations) + '.png')
+                # plt.close()
 
             del_update = np.amax(update) - np.amin(update)
             if del_update / del_psi > max_rel_update_size:
                 update *= np.abs(max_rel_update_size * del_psi / del_update)
             new_residual_flag = True
             num_update_reduce = 0
+
+            fig, ax = plt.subplots(figsize=(6, 10))
+            eq.plasma_psi = trial_plasma_psi.reshape(self.nx, self.ny)
+            eq.xpt = np.copy(profiles.xpt)
+            eq.opt = np.copy(profiles.opt)
+            eq.psi_axis = eq.opt[0, 2]
+            eq.psi_bndry = profiles.psi_bndry
+            eq.flag_limiter = profiles.flag_limiter
+            eq._current = np.sum(profiles.jtor) * self.dRdZ
+            eq._profiles = profiles.copy()
+            try:
+                eq.tokamak_psi = self.tokamak_psi.reshape(self.nx, self.ny)
+            except:
+                pass
+
+            # print(profiles.xpt)
+            
+            save_path = os.path.join('image', 'MAST-U', image_path)
+            os.makedirs(save_path, exist_ok=True)
+            eq.plot(axis=ax, show=False)
+            fig.savefig(save_path + '/iteration_' + str(iterations) + '.png')
+            plt.legend()
+            plt.close()
+
             while new_residual_flag:
 
-                n_trial_plasma_psi = trial_plasma_psi + update
-                
-                new_res0 = self.F_function(
-                    solver, n_trial_plasma_psi,
-                    solver.tokamak_psi, profiles, neural_hangover=neural_flag
-                )
                 try:
+                    n_trial_plasma_psi = trial_plasma_psi + update
+                    
+                    new_res0 = self.solver.F_function(
+                        n_trial_plasma_psi, self.solver.tokamak_psi, profiles
+                    )
                     # n_trial_plasma_psi = trial_plasma_psi + update
                     # new_res0 = solver.F_function(
                     #     n_trial_plasma_psi, solver.tokamak_psi, profiles
                     # )
-                    new_norm_rel_change = solver.relative_norm_residual(
+                    new_norm_rel_change = self.solver.relative_norm_residual(
                         new_res0, n_trial_plasma_psi
                     )
-                    new_rel_change, new_del_psi = solver.relative_del_residual(
+                    new_rel_change, new_del_psi = self.solver.relative_del_residual(
                         new_res0, n_trial_plasma_psi
                     )
                     new_residual_flag = False
@@ -264,7 +320,7 @@ class main():
                         reduced_failure = True
                         break
 
-            if new_norm_rel_change < 1.2 * solver.norm_rel_change[-1]:
+            if new_norm_rel_change < 1.2 * self.solver.norm_rel_change[-1]:
                 trial_plasma_psi = n_trial_plasma_psi.copy()
                 
                 try:
@@ -291,14 +347,14 @@ class main():
                 norm_rel_change = 1.0 * new_norm_rel_change
                 del_psi = 1.0 * new_del_psi
             else:
-                reduce_by = solver.relative_change / new_rel_change                       
+                reduce_by = self.solver.relative_change / new_rel_change                       
                 new_residual_flag = True
                 num_update_reduce = 0
                 while new_residual_flag:
                     try:
                         n_trial_plasma_psi = trial_plasma_psi + update * reduce_by
-                        res0 = solver.F_function(
-                            n_trial_plasma_psi, solver.tokamak_psi, profiles
+                        res0 = self.solver.F_function(
+                            n_trial_plasma_psi, self.solver.tokamak_psi, profiles
                         )
                         new_residual_flag = False
                     except:
@@ -312,27 +368,27 @@ class main():
                 
                 starting_direction = np.copy(res0)
                 trial_plasma_psi = n_trial_plasma_psi.copy()
-                norm_rel_change = solver.relative_norm_residual(
+                norm_rel_change = self.solver.relative_norm_residual(
                     res0, trial_plasma_psi
                 )
-                rel_change, del_psi = solver.relative_del_residual(
+                rel_change, del_psi = self.solver.relative_del_residual(
                     res0, trial_plasma_psi
                 )
-                if rel_change < solver.best_relative_change:
-                    solver.best_relative_change = 1.0 * rel_change
-                    solver.best_psi = np.copy(trial_plasma_psi)
+                if rel_change < self.solver.best_relative_change:
+                    self.solver.best_relative_change = 1.0 * rel_change
+                    self.solver.best_psi = np.copy(trial_plasma_psi)
             
-            solver.relative_change = 1.0 * rel_change
-            solver.norm_rel_change.append(norm_rel_change)
+            self.solver.relative_change = 1.0 * rel_change
+            self.solver.norm_rel_change.append(norm_rel_change)
             print(f"relative error {rel_change:.4e} ")
             iterations += 1
 
-        if solver.best_relative_change < rel_change:
-            solver.relative_change = 1.0 * solver.best_relative_change
-            trial_plasma_psi = np.copy(solver.best_psi)
+        if self.solver.best_relative_change < rel_change:
+            self.solver.relative_change = 1.0 * self.solver.best_relative_change
+            trial_plasma_psi = np.copy(self.solver.best_psi)
             profiles.Jtor(
                 _R_cpu, _Z_cpu,
-                (solver.tokamak_psi + trial_plasma_psi).reshape(
+                (self.solver.tokamak_psi + trial_plasma_psi).reshape(
                     self.nx, self.ny
                     ),
             )
@@ -351,7 +407,7 @@ class main():
             print(
                 f"Forward static solve SUCCESS. Tolerance {rel_change:.2e} (vs. requested {target_relative_tolerance:.2e}) reached in {int(iterations)}/{int(max_solving_iterations)} iterations."
             )
-        
+        print(f"Total solving time: {datetime.now() - start_time}")
         return None
     
 if __name__ == "__main__":
@@ -359,7 +415,12 @@ if __name__ == "__main__":
         Rmin=0.1, Rmax=2.0, Zmin=-2.2, Zmax=2.2,
         nR=65, nZ=129
     )
-    sim.simulation(
-        
-    )
+    # import cProfile
+    # import pstats
+    # import io
+    
+    # with cProfile.Profile() as pr:
+    #     sim.simulation()
+    # pr.dump_stats('profile/profile_MAST-U_deeponet.prof')
+    sim.simulation(image_path='simulation_nk', picard_handover=0.1)
         
