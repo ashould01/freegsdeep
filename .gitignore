@@ -3,7 +3,7 @@ debug*
 *.ipynb
 logs/
 Py-EFIT/
-data*/
+data/
 *.pt
 *.png
 *.txt

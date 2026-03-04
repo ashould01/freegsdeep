@@ -459,9 +459,9 @@ class Integratednet_jax(eqx.Module):
         self, R: JaxArray, Z: JaxArray, rhs: JaxArray,
         bdry_point: JaxArray, bdry_value: JaxArray
         ) -> Tuple[JaxArray, JaxArray]:
-        scaling_rhs = rhs.max() - rhs.min()
+        scaling_rhs = rhs.max() - rhs.min() if rhs.size > 0 else 1.0
         rhs = rhs / scaling_rhs
-        scaling_bdry = bdry_value.max() - bdry_value.min()
+        scaling_bdry = bdry_value.max() - bdry_value.min() if bdry_value.size > 0 else 1.0
         bdry_value = bdry_value / scaling_bdry
         x, y = self.transformation(R, Z)
         resi_output = self.resi_net(x, y, rhs)
@@ -477,7 +477,8 @@ class NKDeepONet(eqx.Module):
     
     def __init__(
         self, nx: int, ny: int, hidden_dim: int,
-        tokamak_input_len: int, key) -> None:
+        tokamak_input_len: int, output_dim: int, key
+        ) -> None:
         key1, key2, key3, key4 = jax.random.split(key, 4)
         self.trunk = Trunk(hidden_dim, key1)
         self.branch_psi = Branch(
@@ -495,8 +496,20 @@ class NKDeepONet(eqx.Module):
         self.mlp_output = eqx.nn.Sequential((
             eqx.nn.Linear(3 * hidden_dim, 128, key=key41),
             eqx.nn.Lambda(jax.nn.relu),
-            eqx.nn.Linear(128, 1, key=key42)
+            eqx.nn.Linear(128, output_dim, key=key42)
         ))
+        self.initialize_weights_tokamak()
+    
+    def initialize_weights_tokamak(self) -> None:
+        for layer in self.branch_tokamak.layers:
+            if isinstance(layer, eqx.nn.Linear):
+                layer = eqx.tree_at(
+                    lambda l: l.weight, layer, layer.weight * 10e-4
+                )
+                if layer.bias is not None:
+                    layer = eqx.tree_at(
+                        lambda l: l.bias, layer, jnp.zeros_like(layer.bias)
+                    )
     
     def __call__(
         self, R: JaxArray, Z: JaxArray, psi: JaxArray, tokamak_params: JaxArray
@@ -538,9 +551,9 @@ class XPlimnet(eqx.Module):
             eqx.nn.Lambda(jax.nn.relu),
             eqx.nn.Linear(128, 128, key=key23),
             eqx.nn.Lambda(jax.nn.relu),
-            eqx.nn.Linear(128, 1, key=key24),
+            eqx.nn.Linear(128, 2, key=key24),
         ))
-        
+
         self.classification = eqx.nn.Sequential((
             eqx.nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, key=key31),
             eqx.nn.MaxPool2d(kernel_size=2, stride=2),
@@ -560,3 +573,220 @@ class XPlimnet(eqx.Module):
         classification = self.classification(features)
         return reconstruction, classification
     
+
+class SpectralConv2d(eqx.Module):
+    kernel_1_r: JaxArray
+    kernel_1_i: JaxArray
+    kernel_2_r: JaxArray
+    kernel_2_i: JaxArray
+    modes1: int = eqx.field(static=True)
+    modes2: int = eqx.field(static=True)
+
+    def __init__(
+        self, in_channels: int, out_channels: int, 
+        modes1: int, modes2: int, key
+        ) -> None:
+        self.modes1 = modes1
+        self.modes2 = modes2
+        scale = 1 / (in_channels * out_channels)
+        key1, key2, key3, key4 = jax.random.split(key, 4)
+        self.kernel_1_r = jax.random.normal(
+            key1, (in_channels, out_channels, modes1, modes2)
+            ) * scale
+        self.kernel_1_i = jax.random.normal(
+            key2, (in_channels, out_channels, modes1, modes2)
+            ) * scale
+        self.kernel_2_r = jax.random.normal(
+            key3, (in_channels, out_channels, modes1, modes2)
+            ) * scale
+        self.kernel_2_i = jax.random.normal(
+            key4, (in_channels, out_channels, modes1, modes2)
+            ) * scale
+
+    def __call__(self, x):
+        # x.shape: [batch, in_channels, height, width]
+
+        # Initialize parameters
+
+        # Checking that the modes are not more than the input size
+
+        # The model assumes real inputs and therefore uses a real
+        # fft. For a 2D signal, the conjugate symmetry of the
+        # transform is exploited to reduce the number of operations.
+        # Given an input signal of dimesions (N, C, H, W), the
+        # output signal will have dimensions (N, C, H, W//2+1).
+        # Therefore the kernel weigths will have different dimensions
+        # for the two axis.
+
+        # Perform fft of the input
+        x_ft = jnp.fft.rfftn(x, axes=(1, 2))
+
+        # Multiply the center of the spectrum by the kernel
+        out_ft = jnp.zeros_like(x_ft)
+        s1 = jnp.einsum(
+            'cij,coij->oij', x_ft[:, :self.modes1, :self.modes2], 
+            self.kernel_1_r + 1j * self.kernel_1_i
+            )
+        s2 = jnp.einsum(
+            'cij,coij->oij', x_ft[:, -self.modes1:, :self.modes2],
+            self.kernel_2_r + 1j * self.kernel_2_i
+            )
+        out_ft = out_ft.at[:, :self.modes1, :self.modes2].set(s1)
+        out_ft = out_ft.at[:, -self.modes1:, :self.modes2].set(s2)
+
+        # Go back to the spatial domain
+        y = jnp.fft.irfftn(out_ft, axes=(1, 2))
+        return y
+
+class FourierStage(eqx.Module):
+    activation: Callable
+    spectral_conv: SpectralConv2d
+    conv: eqx.nn.Conv2d
+
+    def __init__(
+        self, in_channels: int, out_channels: int, 
+        modes1: int, modes2: int, activation: Callable, key
+        ):
+        self.activation = activation
+        key1, key2 = jax.random.split(key, 2)
+        self.spectral_conv = SpectralConv2d(
+            in_channels=in_channels, out_channels=out_channels, 
+            modes1=modes1, modes2=modes2, key=key1
+        )
+        self.conv = eqx.nn.Conv2d(
+            in_channels=in_channels, out_channels=out_channels, 
+            kernel_size=(1, 1), key=key2
+        )
+
+    def __call__(self, x):
+        x_fourier = self.spectral_conv(x)
+        x_local = self.conv(x)
+        return self.activation(x_fourier + x_local)
+
+
+class FNO2D(eqx.Module):
+    '''
+    Fourier Neural Operator for 2D signals.
+
+    Implemented from
+    https://github.com/zongyi-li/fourier_neural_operator/blob/master/fourier_2d.py
+
+    Attributes:
+        modes1: Number of modes in the first dimension.
+        modes2: Number of modes in the second dimension.
+        width: Number of channels to which the input is lifted.
+        depth: Number of Fourier stages
+        channels_last_proj: Number of channels in the hidden layer of the last
+        2-layers Fully Connected (channel-wise) network
+        activation: Activation function to use
+        out_channels: Number of output channels, >1 for non-scalar fields.
+    '''
+    # modes1: int = 12
+    # modes2: int = 12
+    # width: int = 32
+    # depth: int = 4
+    # channels_last_proj: int = 128
+    # activation: Callable = nn.gelu
+    # out_channels: int = 1
+    # padding: int = 0 # Padding for non-periodic inputs
+    enc: eqx.nn.Linear
+    fourier_stages: list
+    film_stages: list
+    dec: eqx.nn.Sequential
+    padding: int = eqx.field(static=True)
+
+    def __init__(
+        self, input_dim: int, output_dim: int, channels_last_proj: int,
+        num_constraints: int,
+        modes1: int, modes2: int, width: int, depth: int,
+        activation: Callable = jax.nn.gelu, key=jax.random.PRNGKey(0),
+        padding: int=1
+        ) -> None:
+
+        key_enc, key_fourier, key_dec = jax.random.split(key, 3)
+        self.padding = padding
+        self.enc = eqx.nn.Linear(input_dim + 2, width, key=key_enc)
+
+        self.fourier_stages = []
+        self.film_stages = []
+
+        key_fourier = jax.random.split(key_fourier, depth * 3)
+        for depthnum in range(depth):
+            acti = activation if depthnum < depth - 1 else lambda x: x
+            self.fourier_stages.append(
+                FourierStage(
+                    in_channels=width,
+                    out_channels=width,
+                    modes1=modes1,
+                    modes2=modes2,
+                    activation=acti,
+                    key=key_fourier[3 * depthnum]
+                )
+            )
+            self.film_stages.append(eqx.nn.Sequential((
+                eqx.nn.Linear(
+                    num_constraints, width * 2, key=key_fourier[3 * depthnum + 1]
+                    ),
+                eqx.nn.Lambda(activation),
+                eqx.nn.Linear(
+                    width * 2, width * 2, key=key_fourier[3 * depthnum + 2]
+                    )
+            )))
+        key_dec1, key_dec2 = jax.random.split(key_dec, 2)
+        self.dec = eqx.nn.Sequential((
+            eqx.nn.Linear(width, channels_last_proj, key=key_dec1),
+            eqx.nn.Lambda(activation),
+            eqx.nn.Linear(channels_last_proj, output_dim, key=key_dec2)
+        ))
+            
+
+    def __call__(self, x: jnp.ndarray, constraints: jnp.ndarray) -> jnp.ndarray:
+        # Generate coordinate grid, and append to input channels
+        grid = self.get_grid(x)
+        x = jnp.concatenate([x, grid], axis=0)
+
+        # Lift the input to a higher dimension
+        width, height = x.shape[1], x.shape[2]
+        x = jnp.permute_dims(x, (1, 2, 0))
+        x = x.reshape(-1, x.shape[-1])
+        x = jax.vmap(self.enc)(x)
+        x = x.reshape(width, height, x.shape[-1])
+        x = jnp.permute_dims(x, (2, 0, 1))
+
+        # Pad input
+        if self.padding > 0:
+            x = jnp.pad(
+                x,
+                ((0, 0), (0, self.padding), (0, self.padding)),
+                mode='constant'
+            )
+
+        # Apply Fourier stages, last one has no activation
+        # (can't find this in the paper, but is in the original code)
+        for fourier_stage, film_stage in zip(
+            self.fourier_stages, self.film_stages
+            ):
+            x = fourier_stage(x)
+            gamma, beta = jnp.split(film_stage(constraints), 2, axis=0)
+            x = gamma[:, None, None] * x + beta[:, None, None]
+
+        # Unpad
+        if self.padding > 0:
+            x = x[:, :-self.padding, :-self.padding]
+
+        # Project to the output channels
+        x = jnp.permute_dims(x, (1, 2, 0))
+        x = x.reshape(-1, x.shape[-1])
+        x = jax.vmap(self.dec)(x)
+        x = x.reshape(width, height, -1)
+        x = jnp.permute_dims(x, (2, 0, 1))
+
+        return x
+
+    @staticmethod
+    def get_grid(x):
+        x1 = jnp.linspace(0, 1, x.shape[1])
+        x2 = jnp.linspace(0, 1, x.shape[2])
+        x1, x2 = jnp.meshgrid(x1, x2, indexing = 'ij')
+        grid = jnp.stack([x1, x2], axis=0)
+        return grid
