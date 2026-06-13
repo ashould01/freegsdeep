@@ -17,6 +17,13 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+freegsnke/
+IsUMap/
+image/
+pinn/
+profile/
+pyhessian/
+freegs/
 .Python
 build/
 develop-eggs/
