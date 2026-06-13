@@ -86,7 +86,7 @@ class GSrhsdataset(Dataset):
             phy_list = []
             for p, i, f in zip(paxis, Ip, fvac):
                 phy_list.append(
-                    (p, i, f, 1.0, 2.0, [(1.1, -0.6), (1.1, 0.8)], [(1.1, -0.6, 1.1, 0.6)])
+                    (p, i, f, 1.8, 1.2, [(1.1, -0.6), (1.1, 0.8)], [(1.1, -0.6, 1.1, 0.6)])
                 )
             atol, rtol = 1e-6, 1e-4
             blend = 0.0
@@ -328,9 +328,8 @@ class GSrhsdatasetMASTU_f(Dataset):
             assert save_path is None, "Cannot load and save at the same time."
             self.load_path(load_path)
         else:
-            self.generate_data(num, max_iter)
-            if save_path is not None:
-                self.save_data(save_path)
+            self.generate_data(num, max_iter, save_path)
+            self.save_data(save_path)
 
     def load_path(self, load_path: str) -> None:
         load_path = os.path.join('data', load_path)
@@ -342,6 +341,7 @@ class GSrhsdatasetMASTU_f(Dataset):
         self.psi_g = torch.load(os.path.join(load_path, 'psi_g.pt'), weights_only=True)
         self.update_g = torch.load(os.path.join(load_path, 'update_g.pt'), weights_only=True)
         self.tokamak_psi_g = torch.load(os.path.join(load_path, 'tokamak_psi_g.pt'), weights_only=True)
+        self.R0_g = torch.load(os.path.join(load_path, 'R0_g.pt'), weights_only=True)
         self.constraint_g = torch.load(os.path.join(load_path, 'constraint_g.pt'), weights_only=True)
         self.Q_list_g = torch.load(os.path.join(load_path, 'Q_list_g.pt'), weights_only=True)
         self.G_list_g = torch.load(os.path.join(load_path, 'G_list_g.pt'), weights_only=True)
@@ -354,7 +354,7 @@ class GSrhsdatasetMASTU_f(Dataset):
         return None
     
     def generate_data(
-        self, num: int, max_iter: int, 
+        self, num: int, max_iter: int, save_path: Optional[str],
         alpha_m: float = 1.8, alpha_n: float = 1.2
         ) -> None:
 
@@ -369,6 +369,7 @@ class GSrhsdatasetMASTU_f(Dataset):
         self.psi_list_f = []
         self.rhs_f = []
         self.bdry_f = []
+        self.res0_f = []
         self.idx_g = []
         self.update_g = []
         self.psi_list_g = []
@@ -404,13 +405,13 @@ class GSrhsdatasetMASTU_f(Dataset):
         with open('freegsnke/examples/data/simple_limited_currents_PaxisIp.pk', 'rb') as f:
             currents_dict_limited = pickle.load(f)
 
-        # paxis = [8e3]
-        # Ip = [6e5]
-        # fvac = [0.5]
-        paxis = np.random.uniform(1e3, 5e4, (num))
-        Ip = np.random.uniform(5e4, 1e6, (num))
-        fvac = np.random.uniform(0.5, 1.5, (num))
-        limited_or_diverted = np.random.choice([0, 1], size=(num))
+        paxis = [8e3]
+        Ip = [6e5]
+        fvac = [0.5]
+        # paxis = np.random.uniform(1e3, 5e4, (num))
+        # Ip = np.random.uniform(5e4, 1e6, (num))
+        # fvac = np.random.uniform(0.5, 1.5, (num))
+        # limited_or_diverted = np.random.choice([0, 1], size=(num))
         phy_list = []
         for p, i, f in zip(paxis, Ip, fvac):
             phy_list.append(
@@ -419,15 +420,8 @@ class GSrhsdatasetMASTU_f(Dataset):
 
         target_relative_tolerance = 1e-6
         max_solving_iterations = max_iter
-        Picard_handover = 0.2
+        Picard_handover = 0.1
         max_rel_update_size = 0.15
-
-        linear_GS_solver = createVcycle(
-            self.nx, self.ny, GSsparse4thOrder(
-                self.Rmin, self.Rmax, self.Zmin, self.Zmax,
-            ),
-            nlevels=1, ncycle=1, niter=100, direct=False
-        )
 
         for idx, (paxis, Ip, fvac, alpm, alpn) in enumerate(phy_list):
             eq = equilibrium_update.Equilibrium(
@@ -435,10 +429,12 @@ class GSrhsdatasetMASTU_f(Dataset):
                 Rmin=self.Rmin, Rmax=self.Rmax, Zmin=self.Zmin,
                 Zmax=self.Zmax, nx=self.nx, ny=self.ny,
             )
-            currents_dict = currents_dict_diverted if limited_or_diverted[idx] == 1 else currents_dict_limited 
-            currents_dict_perturb = np.random.uniform(
-                low=0.5, high=1.75, size=len(currents_dict)
-            )
+            # currents_dict = currents_dict_diverted if limited_or_diverted[idx] == 1 else currents_dict_limited 
+            currents_dict = currents_dict_diverted
+            # currents_dict_perturb = np.random.uniform(
+            #     low=0.5, high=1.75, size=len(currents_dict)
+            # )
+            currents_dict_perturb = np.ones(len(currents_dict))
             constraint = [paxis, Ip, fvac]
             current_iter = []
             for idx2, key in enumerate(currents_dict.keys()):
@@ -499,9 +495,10 @@ class GSrhsdatasetMASTU_f(Dataset):
             solver.initial_rel_residual = 1.0 * rel_change
             iterations = 0
             reduced_failure = False
-            while (rel_change > target_relative_tolerance) * (
-                iterations < max_solving_iterations
-            ) and reduced_failure == False:
+            # while (rel_change > target_relative_tolerance) * (
+            #     iterations < max_solving_iterations
+            # ) and reduced_failure == False:
+            while (iterations < max_solving_iterations) and reduced_failure == False:
                 if rel_change > Picard_handover:
                     print(f"{idx} | Picard iteration " + str(iterations))
 
@@ -566,7 +563,7 @@ class GSrhsdatasetMASTU_f(Dataset):
                             self.tokamak_psi_h.append(solver.tokamak_psi)
                             self.psi_axis_h.append(profiles.inputs[0])
                             self.psi_bndry_h.append(profiles.psi_bndry)
-                            self.flag_limiter_h.append(profiles.flag_limiter)
+                            self.flag_limiter_h.append(profiles.flag_limiter) 
                             if picard_flag == False:
                                 self.idx_g.append(idx)
                                 self.psi_list_g.append(trial_plasma_psi)
@@ -574,7 +571,7 @@ class GSrhsdatasetMASTU_f(Dataset):
                                 self.R0_g.append(solver.nksolver.R0)
                                 self.constraint_g.append(constraint)
                                 self.update_g.append(solver.nksolver.dx)
-                                self.G_list_g.append(solver.nksolver.Gn)
+                                self.G_list_g.append(solver.nksolver.G)
                                 self.Q_list_g.append(solver.nksolver.Qn)
 
                             solver.rhs[0, :] = solver.psi_boundary[0, :]
@@ -582,11 +579,11 @@ class GSrhsdatasetMASTU_f(Dataset):
                             solver.rhs[-1, :] = solver.psi_boundary[-1, :]
                             solver.rhs[:, -1] = solver.psi_boundary[:, -1]
                             
-                            new_res0 = n_trial_plasma_psi - (
+                            new_res0 = n_trial_plasma_psi - \
                                 solver.linear_GS_solver(
                                     solver.psi_boundary, solver.rhs
-                                    )
-                            ).reshape(-1)
+                                    ).reshape(-1)
+                            self.res0_f.append(new_res0)
                             if ~np.any(np.isnan(solver.psi_boundary)):
                                 self.psi_list_f.append(solver.linear_GS_solver(
                                         solver.psi_boundary, solver.rhs
@@ -694,44 +691,50 @@ class GSrhsdatasetMASTU_f(Dataset):
                     f"(vs. requested {target_relative_tolerance:.2e}) "\
                     f"reached in {int(iterations)}/{int(max_solving_iterations)}  iterations."
                 )
+        
+            if ((idx + 1) % 10 == 0) & (save_path is not None):
+                print(f"Saving data at index {idx} ...")
+                self.save_data(save_path)
 
     def save_data(self, save_path: str) -> None:
         save_path = os.path.join('data', save_path)
         os.makedirs(save_path, exist_ok=True)
-        self.idx_f = torch.from_numpy(np.array(self.idx_f[:-1]))
-        self.rhs_f = torch.from_numpy(np.array(self.rhs_f[:-1]))
-        self.bdry_f = torch.from_numpy(np.array(self.bdry_f[:-1]))
-        self.psi_list_f = torch.from_numpy(np.array(self.psi_list_f[1:]))
-        self.idx_g = torch.from_numpy(np.array(self.idx_g))
-        self.psi_g = torch.from_numpy(np.array(self.psi_list_g))
-        self.update_g = torch.from_numpy(np.array(self.update_g))
-        self.tokamak_psi_g = torch.from_numpy(np.array(self.tokamak_psi_g))
-        self.constraint_g = torch.from_numpy(np.array(self.constraint_g))
-        self.R0_g = torch.from_numpy(np.array(self.R0_g))
-        self.Q_list_g = torch.from_numpy(np.array(self.Q_list_g))
-        self.G_list_g = torch.from_numpy(np.array(self.G_list_g))
-        self.psi_h = torch.from_numpy(np.array(self.psi_list_h))
-        self.tokamak_psi_h = torch.from_numpy(np.array(self.tokamak_psi_h))
-        self.psi_axis_h = torch.from_numpy(np.array(self.psi_axis_h))
-        self.psi_bndry_h = torch.from_numpy(np.array(self.psi_bndry_h))
-        self.flag_limiter_h = torch.from_numpy(np.array(self.flag_limiter_h))
-        torch.save(self.idx_f, os.path.join(save_path, 'index_f.pt'))
-        torch.save(self.rhs_f, os.path.join(save_path, 'rhs_f.pt'))
-        torch.save(self.bdry_f, os.path.join(save_path, 'bdry_f.pt'))
-        torch.save(self.psi_list_f, os.path.join(save_path, 'psi_f.pt'))
-        torch.save(self.idx_g, os.path.join(save_path, 'index_g.pt'))
-        torch.save(self.psi_g, os.path.join(save_path, 'psi_g.pt'))
-        torch.save(self.update_g, os.path.join(save_path, 'update_g.pt'))
-        torch.save(self.tokamak_psi_g, os.path.join(save_path, 'tokamak_psi_g.pt'))
-        torch.save(self.G_list_g, os.path.join(save_path, 'G_list_g.pt'))
-        torch.save(self.constraint_g, os.path.join(save_path, 'constraint_g.pt'))
-        torch.save(self.Q_list_g, os.path.join(save_path, 'Q_list_g.pt'))
-        torch.save(self.R0_g, os.path.join(save_path, 'R0_g.pt'))
-        torch.save(self.psi_h, os.path.join(save_path, 'psi_h.pt'))
-        torch.save(self.tokamak_psi_h, os.path.join(save_path, 'tokamak_psi_h.pt'))
-        torch.save(self.psi_axis_h, os.path.join(save_path, 'psi_axis_h.pt'))
-        torch.save(self.psi_bndry_h, os.path.join(save_path, 'psi_bndry_h.pt'))
-        torch.save(self.flag_limiter_h, os.path.join(save_path, 'flag_limiter_h.pt'))
+        idx_f = torch.from_numpy(np.array(self.idx_f[:-1]))
+        rhs_f = torch.from_numpy(np.array(self.rhs_f[:-1]))
+        bdry_f = torch.from_numpy(np.array(self.bdry_f[:-1]))
+        res0_f = torch.from_numpy(np.array(self.res0_f[:-1]))
+        psi_list_f = torch.from_numpy(np.array(self.psi_list_f[1:]))
+        idx_g = torch.from_numpy(np.array(self.idx_g))
+        psi_g = torch.from_numpy(np.array(self.psi_list_g))
+        update_g = torch.from_numpy(np.array(self.update_g))
+        tokamak_psi_g = torch.from_numpy(np.array(self.tokamak_psi_g))
+        constraint_g = torch.from_numpy(np.array(self.constraint_g))
+        R0_g = torch.from_numpy(np.array(self.R0_g))
+        Q_list_g = torch.from_numpy(np.array(self.Q_list_g))
+        G_list_g = torch.from_numpy(np.array(self.G_list_g))
+        psi_h = torch.from_numpy(np.array(self.psi_list_h))
+        tokamak_psi_h = torch.from_numpy(np.array(self.tokamak_psi_h))
+        psi_axis_h = torch.from_numpy(np.array(self.psi_axis_h))
+        psi_bndry_h = torch.from_numpy(np.array(self.psi_bndry_h))
+        flag_limiter_h = torch.from_numpy(np.array(self.flag_limiter_h))
+        torch.save(idx_f, os.path.join(save_path, 'index_f.pt'))
+        torch.save(rhs_f, os.path.join(save_path, 'rhs_f.pt'))
+        torch.save(bdry_f, os.path.join(save_path, 'bdry_f.pt'))
+        torch.save(psi_list_f, os.path.join(save_path, 'psi_f.pt'))
+        torch.save(idx_g, os.path.join(save_path, 'index_g.pt'))
+        torch.save(psi_g, os.path.join(save_path, 'psi_g.pt'))
+        torch.save(update_g, os.path.join(save_path, 'update_g.pt'))
+        torch.save(tokamak_psi_g, os.path.join(save_path, 'tokamak_psi_g.pt'))
+        torch.save(G_list_g, os.path.join(save_path, 'G_list_g.pt'))
+        torch.save(constraint_g, os.path.join(save_path, 'constraint_g.pt'))
+        torch.save(Q_list_g, os.path.join(save_path, 'Q_list_g.pt'))
+        torch.save(R0_g, os.path.join(save_path, 'R0_g.pt'))
+        torch.save(psi_h, os.path.join(save_path, 'psi_h.pt'))
+        torch.save(tokamak_psi_h, os.path.join(save_path, 'tokamak_psi_h.pt'))
+        torch.save(psi_axis_h, os.path.join(save_path, 'psi_axis_h.pt'))
+        torch.save(psi_bndry_h, os.path.join(save_path, 'psi_bndry_h.pt'))
+        torch.save(flag_limiter_h, os.path.join(save_path, 'flag_limiter_h.pt'))
+        torch.save(res0_f, os.path.join(save_path, 'res0_f.pt'))
         return None
 
     def __len__(self):

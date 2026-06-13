@@ -7,7 +7,7 @@ from scipy.ndimage import maximum_filter
 from skimage import measure
 from matplotlib.path import Path
 from jax.scipy.special import beta
-from freegsnke.limiter_func import Limiter_handler
+from freegsnke.freegsnke.limiter_func import Limiter_handler
 from freegs4e.gradshafranov import Greens
 
 _NUM_DUPLICATION_STEPS = 6
@@ -174,6 +174,20 @@ def ellipe(m: jax.Array) -> jax.Array:
     # first force the known endpoint
     val = jnp.where(m == 1.0, 1.0, val)
     return jnp.where(m > 1.0, jnp.nan, val)
+
+def Greens_jax(Rc, Zc, R, Z, mu0=4.0 * jnp.pi * 1e-7):
+    k2 = 4.0 * R * Rc / ((R + Rc) ** 2 + (Z - Zc) ** 2)
+
+    k2 = jnp.clip(k2, 1e-10, 1.0 - 1e-10)
+    k = jnp.sqrt(k2)
+
+    # note definition of ellipk, ellipe in scipy is K(k^2), E(k^2)
+    return (
+        (mu0 / (2.0 * jnp.pi))
+        * jnp.sqrt(R * Rc)
+        * ((2.0 - k2) * ellipk(k2) - 2.0 * ellipe(k2))
+        / k
+    )
 
 from jax import lax
 
@@ -474,7 +488,7 @@ class vectorized_nksolver:
         self.n_it -= 1
         dx = jnp.copy(self.Q[:, self.n_it])
 
-        explore = 1
+        explore = 1 
         while explore:
             # build Arnoldi update
             dx = self.Arnoldi_unit(x0, dx, R0, F_function, args)
@@ -513,10 +527,10 @@ class vectorized_nksolver:
             )
 
             explore = self.n_it < max_n_directions
-            # explore *= (
-            #     self.relative_unexplained_residuals[-1]
-            #     > target_relative_unexplained_residual
-            # )
+            explore *= (
+                self.relative_unexplained_residuals[-1]
+                > target_relative_unexplained_residual
+            )
             # explore = self.n_it < 6
 
             # prepare for next step
@@ -551,6 +565,30 @@ class vectorized_nksolver:
         # Hm_ = np.copy(self.Hm[: self.n_it + 2, : self.n_it + 1])
         # self.coeffs = -self.sign * nR0 * np.dot(np.linalg.inv(Hm_.T@Hm_ + self.collinear_aware_regulariz), Hm_[0])
         # self.vanilla_coeffs = np.dot(np.linalg.inv(self.G[:, : self.n_it + 1].T@self.G[:, : self.n_it + 1] + self.collinear_aware_regulariz), np.dot(self.G[:, : self.n_it + 1].T, -R0))
+        collinearity_penalty = jnp.diag(
+            jnp.max(
+                1
+                / (1 - jnp.abs(self.collinearity[: self.n_it + 1, : self.n_it + 1]))
+                ** 2,
+                axis=0,
+            )
+            - 1
+        )
+        collinear_aware_regulariz = (
+            jnp.eye(self.n_it + 1) * self.l2_reg
+            + collinearity_penalty * self.collinearity_reg
+        )
+        self.collinear_aware_regulariz = collinear_aware_regulariz * nR0**2
+
+        # solve the regularised least sq problem
+        coeffs = jnp.dot(
+            jnp.linalg.inv(
+                self.G[:, : self.n_it + 1].T @ self.G[:, : self.n_it + 1] \
+                + self.collinear_aware_regulariz
+            ),
+            jnp.dot(self.G[:, : self.n_it + 1].T, -R0),
+        )
+        coeffs = jnp.clip(coeffs, -clip, clip)
 
         self.coeffs = jnp.copy(coeffs)
         self.dx = jnp.sum(self.Q[:, : self.n_it + 1] * coeffs[jnp.newaxis, :], axis=1)
@@ -1607,3 +1645,185 @@ class LaplaceSparse:
                 A = A.at[row, row + ny].set(1.0 / dx**2)
         # Convert to Compressed Sparse Row (CSR) format
         return A.tocsr()
+
+from freegsnke import nk_solver_H
+
+class PCA_preconditioner(nk_solver_H.nksolver):
+
+    def __init__(self, problem_dimension, P, Q, F_mean):
+        super().__init__(problem_dimension)
+        self.P_PCA = P
+        self.Q_PCA = Q
+        self.F_mean = F_mean
+    
+    def Arnoldi_iteration(
+        self,
+        x0,
+        dx,
+        R0,
+        F_function,
+        args,
+        step_size,
+        scaling_with_n,
+        target_relative_unexplained_residual,
+        max_n_directions,
+        clip,
+        # l2_reg=1e-5,
+        # collinearity_reg=1e-6,
+    ):
+
+        nR0 = np.linalg.norm(R0)
+        self.max_dim = int(max_n_directions + 1)
+
+        # orthogonal basis in x space
+        self.Q = np.zeros((self.problem_dimension, self.max_dim))
+        # orthonormal basis in x space
+        self.Qn = np.zeros((self.problem_dimension, self.max_dim))
+
+        # basis in residual space
+        self.G = np.zeros((self.problem_dimension, self.max_dim))
+        # orthonormal basis in residual space
+        self.Gn = np.zeros((self.problem_dimension, self.max_dim))
+        # norms of residual vectors
+        self.n_G = np.zeros(self.max_dim)
+
+        self.collinearity = np.zeros((self.max_dim, self.max_dim))
+
+        # QR decomposition of Hm: Hm = T@R
+        # self.Omega = np.array([[1]])
+
+        # Hessenberg matrix
+        self.Hm = np.zeros((self.max_dim + 1, self.max_dim))
+
+        # resize step based on residual
+        adjusted_step_size = step_size * nR0
+
+        # prepare for first direction exploration
+        self.n_it = 0
+        self.n_it_tot = 0
+        this_step_size = adjusted_step_size * ((1 + self.n_it) ** scaling_with_n)
+
+        dx /= np.linalg.norm(dx)
+        # # new addition
+        # if clip_quantiles is not None:
+        #     q1, q2 = np.quantile(dx, clip_quantiles)
+        #     dx = np.clip(dx, q1, q2)
+
+        self.Qn[:, self.n_it] = np.copy(dx)
+        dx *= this_step_size
+        self.Q[:, self.n_it] = np.copy(dx)
+
+        explore = 1
+        while explore:
+            # build Arnoldi update
+            dx = self.Arnoldi_unit(x0, dx, R0, F_function, args)
+
+            # prepare to calculate explained residual
+            collinearity_penalty = np.diag(
+                np.max(
+                    1
+                    / (1 - np.abs(self.collinearity[: self.n_it + 1, : self.n_it + 1]))
+                    ** 2,
+                    axis=0,
+                )
+                - 1
+            )
+            collinear_aware_regulariz = (
+                np.eye(self.n_it + 1) * self.l2_reg
+                + collinearity_penalty * self.collinearity_reg
+            )
+            self.collinear_aware_regulariz = collinear_aware_regulariz * nR0**2
+
+            # solve the regularised least sq problem
+            coeffs = np.dot(
+                np.linalg.inv(
+                    self.G[:, : self.n_it + 1].T @ self.G[:, : self.n_it + 1]
+                    + self.collinear_aware_regulariz
+                ),
+                np.dot(self.G[:, : self.n_it + 1].T, -R0),
+            )
+            coeffs = np.clip(coeffs, -clip, clip)
+            # calculare the corresponding fraction of residual that is currently explained
+            expl_res = np.sum(
+                self.G[:, : self.n_it + 1] * coeffs[np.newaxis, :], axis=1
+            )
+            self.relative_unexplained_residuals.append(
+                np.linalg.norm(R0 + expl_res) / nR0
+            )
+
+            explore = self.n_it < max_n_directions
+            explore *= ( 
+                self.relative_unexplained_residuals[-1]
+                > target_relative_unexplained_residual
+            )
+
+            # prepare for next step
+            if explore:
+                self.n_it += 1
+                # # new addition
+                # if clip_quantiles is not None:
+                #     q1, q2 = np.quantile(dx, clip_quantiles)
+                #     dx = np.clip(dx, q1, q2)
+                self.Qn[:, self.n_it] = np.copy(dx)
+                this_step_size = adjusted_step_size * (
+                    (1 + self.n_it) ** scaling_with_n
+                )
+                dx *= this_step_size
+                self.Q[:, self.n_it] = np.copy(dx)
+
+        # self.coeffs = -nR0 * np.dot(
+        #     np.linalg.inv(self.Omega[:-1] @ self.Hm[: self.n_it + 2, : self.n_it + 1]),
+        #     self.Omega[:-1, 0],
+        # )
+
+        # collinearity = np.sum(self.G[:,np.newaxis,:self.n_it + 1]*self.G[:,:self.n_it + 1,np.newaxis],axis=0)
+        # d_collinearity = np.diag(collinearity)**.5
+        # collinearity /= (d_collinearity[:, np.newaxis] * d_collinearity[np.newaxis, :])
+        # self.collinearity = np.abs(np.triu(collinearity, 1))
+        # d_collinearity = np.diag(np.max(1/(1-np.abs(self.collinearity))**2, axis=0))
+
+        # collinear_aware_regulariz = np.eye(self.n_it + 1)*1e-4
+        # collinear_aware_regulariz += d_collinearity*1e-4
+        # self.collinear_aware_regulariz = collinear_aware_regulariz * nR0**2
+
+        # Hm_ = np.copy(self.Hm[: self.n_it + 2, : self.n_it + 1])
+        # self.coeffs = -self.sign * nR0 * np.dot(np.linalg.inv(Hm_.T@Hm_ + self.collinear_aware_regulariz), Hm_[0])
+        # self.vanilla_coeffs = np.dot(np.linalg.inv(self.G[:, : self.n_it + 1].T@self.G[:, : self.n_it + 1] + self.collinear_aware_regulariz), np.dot(self.G[:, : self.n_it + 1].T, -R0))
+
+        self.coeffs = np.copy(coeffs)
+        self.dx = np.sum(self.Q[:, : self.n_it + 1] * coeffs[np.newaxis, :], axis=1)
+
+def PCA_preconditioner(P, Q, F_data_mean, x0, R0, F_function, args):
+
+    R0 = P @ P.T @ (R0 - F_data_mean) + F_data_mean
+    nR0 = np.linalg.norm(R0)
+    step_size = nR0 * 2.5
+    index = 0
+    PR0 = P.T @ R0
+
+    while True:
+        approx_jvp = np.zeros_like(Q)
+        for i in range(Q.shape[1]):
+            approx_jvp[:, i] = F_function(x0 + step_size * Q[:, i], *args) - R0
+        PJ = P.T @ approx_jvp
+        Sp = np.linalg.solve(PJ, -PR0)
+
+
+        dx = step_size * Q @ Sp
+        R0 = P @ P.T @ (F_function(x0 + dx, *args) - F_data_mean) + F_data_mean
+        if (
+            np.linalg.norm(R0) < 0.2 * nR0
+            ) | (index >= 30):
+            
+            print('index : ', index)
+            break
+
+        PR0 = P.T @ R0
+        index += 1
+
+        
+    return x0 + step_size * Q @ Sp
+
+
+    
+

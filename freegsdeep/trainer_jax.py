@@ -631,8 +631,7 @@ class Trainer_g:
         nR: int, nZ: int, batch_size: int, epoch: int, len_data: Optional[int],
         data_load_path: Optional[str], data_save_path: Optional[str],
         use_nk_loss: bool = True, use_g: bool = True,
-        linear_solver_load_path_dict: Optional[Dict] = None,
-        xplim_load_path_dict: Optional[Dict] = None,
+        output_dim: int = 5
         ) -> None:
         assert ((len_data != None) and (data_save_path != None)) or \
             ((len_data == None) and (data_load_path != None)), \
@@ -656,6 +655,7 @@ class Trainer_g:
         )
         self.resi = jnp.asarray(self.dataset.residual)
         self.bdry = jnp.asarray(self.dataset.boundary)
+        self.output_dim = output_dim
         # R_1D = jnp.linspace(Rmin, Rmax, nR)
         # Z_1D = jnp.linspace(Zmin, Zmax, nZ)
         # bndry_indices = np.concatenate(
@@ -740,7 +740,7 @@ class Trainer_g:
         is_linear = lambda x: isinstance(x, eqx.nn.Linear)
         get_weights = lambda m: [
             x.weight for x in jax.tree_util.tree_leaves(
-                m.branch_tokamak, is_leaf=is_linear
+                m.film_stages, is_leaf=is_linear
                 ) if is_linear(x)
             ]
         weights = get_weights(model)
@@ -761,11 +761,6 @@ class Trainer_g:
         sharding = jax.sharding.NamedSharding(mesh, P('batch'))
         sharding_model = jax.sharding.NamedSharding(mesh, P())
 
-        if self.use_nk_loss:
-            self.output_dim = 9 
-        else:
-            self.output_dim = 1
-
         # model = NKDeepONet(
         #     nx=self.nR, ny=self.nZ, hidden_dim=15, 
         #     tokamak_input_len=3, output_dim=self.output_dim, key=jax.random.PRNGKey(0)
@@ -775,6 +770,7 @@ class Trainer_g:
             input_dim=3, output_dim=self.output_dim, channels_last_proj=128, num_constraints=3,
             modes1=16, modes2=16, width=32, depth=4
             )
+        model = self.init_linear_weight(model)
         save_path, train_dataloader, test_dataloader, load_epoch = \
             self.preprocess(save_name, load_name)
             
@@ -791,13 +787,12 @@ class Trainer_g:
         )
         params = eqx.filter(model, eqx.is_array)
         opt_state = grad_transf.init(params)
-        model, opt_state = eqx.filter_shard((model, opt_state), sharding_model)
         for epoch in range(load_epoch, self.epoch):
             loss = test_loss = 0.0
             num_data = num_data_test = 0
             for _i, batch in enumerate(train_dataloader):
                 # idx, plasma_psi, tokamak_psi, constraint, update = batch
-                idx, plasma_psi, tokamak_psi, constraint, _, G = batch
+                idx, plasma_psi, tokamak_psi, constraint, R0, Q, G = batch
                 plasma_psi = jnp.asarray(
                     plasma_psi.reshape(-1, 1, self.nR, self.nZ)
                 )
@@ -805,13 +800,14 @@ class Trainer_g:
                     tokamak_psi.reshape(-1, 1, self.nR, self.nZ)
                 )
                 constraint = jnp.asarray(constraint)
+                R0 = jnp.asarray(R0.reshape(-1, 1, self.nR, self.nZ))
                 # update = jnp.asarray(update)
+                Q = jnp.asarray(Q)
                 G = jnp.asarray(G)
 
-                (model, opt_state), loss_batch = self.make_step(
+                model, opt_state, (loss_batch, aux_batch) = self.make_step(
                     model, opt_state, plasma_psi,
-                    tokamak_psi, constraint, G, grad_transf,
-                    sharding, sharding_model
+                    tokamak_psi, R0, constraint, Q, G, grad_transf,
                     )
                 # (model, opt_state), loss_batch = self.make_step(
                 #     model, opt_state, plasma_psi,
@@ -819,7 +815,11 @@ class Trainer_g:
                 #     sharding, sharding_model
                 #     )
                 if (_i + 1) % 20 == 0:
-                    print(f'Step {_i+1} | Loss: {loss_batch:.6e}')
+                    print(
+                        f'Step {_i+1:03d} | Loss: {loss_batch:.6e} ' \
+                        f'| aux_0 {aux_batch[0]:.3e} ' \
+                        f'| aux_1 {aux_batch[1]:.3e}'
+                        )
                 loss += loss_batch
                 num_data += len(idx)
 
@@ -832,7 +832,7 @@ class Trainer_g:
                 self.save(model, epoch, save_path)
 
             for _i, batch in enumerate(test_dataloader):
-                idx, plasma_psi, tokamak_psi, constraint, Q, _ = batch
+                idx, plasma_psi, tokamak_psi, constraint, R0, _, Q = batch
                 plasma_psi = jnp.asarray(
                     plasma_psi.reshape(-1, 1, self.nR, self.nZ)
                 )
@@ -840,15 +840,16 @@ class Trainer_g:
                     tokamak_psi.reshape(-1, 1, self.nR, self.nZ)
                 )
                 constraint = jnp.asarray(constraint)
+                R0 = jnp.asarray(R0.reshape(-1, 1, self.nR, self.nZ))
                 Q = jnp.asarray(Q)
                 # test_loss_batch = self.loss(
                 #     params, static, plasma_psi, tokamak_psi, constraint
                 #     )
-                test_loss_batch = self.loss_data(
-                    model, plasma_psi, tokamak_psi, constraint, Q,
-                    sharding, sharding_model
+                param, static = eqx.partition(model, eqx.is_array)
+                test_loss_batch = self.loss_data_2(
+                    param, static, plasma_psi, tokamak_psi, R0, constraint, Q,
                 )
-                test_loss += test_loss_batch
+                test_loss += test_loss_batch[0]
                 num_data_test += len(idx)
             test_loss /= num_data_test
             print(
@@ -1012,17 +1013,19 @@ class Trainer_g:
             ), axis=1).sum()
         return loss
 
+    @eqx.filter_jit
     def loss_nk(
         self,
         params: JaxArray, static,
         plasma_psi: Float64[JaxArray, "batch 1 nx ny"],
         tokamak_psi: Float64[JaxArray, "batch 1 nx ny"],
+        R0: Float64[JaxArray, "batch 1"],
         constraints: Float64[JaxArray, "batch n_params"],
         G: Float64[JaxArray, "batch nx*ny output_dim"]
         ) -> Float64[JaxArray, ""]:
 
         model = eqx.combine(params, static)
-        psi = jnp.concatenate([plasma_psi, tokamak_psi], axis=1)
+        psi = jnp.concatenate([plasma_psi, tokamak_psi, R0], axis=1)
         
         # vmap_model = vmap(
         #     vmap(model, in_axes=(0, 0, None, None)),
@@ -1041,12 +1044,10 @@ class Trainer_g:
         Q, _ = jnp.linalg.qr(output, mode='reduced')
 
         if self.use_g:
-            n_G = jnp.linalg.norm(G, axis=1, keepdims=True)
-            Gn = G / n_G
-            invar_loss = Gn - jnp.matmul(jnp.matmul(
-                Q,
-                jnp.permute_dims(Q, (0, 2, 1))
-                ), Gn)
+            invar_loss = jnp.where(
+                (G != 0).all(axis=2, keepdims=True),
+                G - jnp.matmul(jnp.matmul(Q, jnp.permute_dims(Q, (0, 2, 1))), G),
+                0.0)
         
         else:
             # (1) Boundary condition update after update toroidal plasma current 
@@ -1120,20 +1121,22 @@ class Trainer_g:
         # jax.debug.print("loss | {x}", x=loss)
         # break_if_nan(psi_sol)
         # jax.debug.breakpoint()
-        return loss
+        return loss, loss
     
-    @eqx.filter_jit(donate="all-except-first")
+    @eqx.filter_jit
     def loss_data(
-        self, model: NKDeepONet,
+        self,
+        params, static, 
         plasma_psi: Float64[JaxArray, "batch nx*ny"],
         tokamak_psi: Float64[JaxArray, "batch nx*ny"],
+        R0: Float64[JaxArray, "batch nx*ny"],
         constraints: Float64[JaxArray, "batch n_params"],
         Q: Float64[JaxArray, "batch nx*ny output_dim"],
-        sharding: jax.sharding.NamedSharding,
-        sharding_model: jax.sharding.NamedSharding
+        lamda: Float64 = 1.0
         ) -> Float64[JaxArray, ""]:
         
-        psi = jnp.concatenate([plasma_psi, tokamak_psi], axis=1)
+        model = eqx.combine(params, static)
+        psi = jnp.concatenate([plasma_psi, tokamak_psi, R0], axis=1)
 
         vmap_model = vmap(model)
         output = vmap_model(psi, constraints)
@@ -1141,11 +1144,44 @@ class Trainer_g:
             -1, self.nR * self.nZ, self.output_dim
             )
 
-        Q_predict, _ = jnp.linalg.qr(output, mode='reduced')
+        loss_space = jnp.linalg.norm(jnp.where(
+            (Q[:, :, :5] != 0).all(axis=2, keepdims=True), 
+            Q[:, :, :5] - output, 0
+            ), axis=(1, 2), ord='fro').sum()
+        loss_ortho = jnp.linalg.norm(
+            jnp.permute_dims(output, (0, 2, 1)) @ output - jnp.eye(self.output_dim)[None, :, :], axis=(1, 2), ord='fro'
+        ).sum()
 
-        loss = jnp.linalg.norm(Q - Q_predict, axis=(1, 2), ord='fro').sum()
+        return loss_space + lamda * loss_ortho, (loss_space, loss_ortho)
+    
+    @eqx.filter_jit
+    def loss_data_2(
+        self, params, static,
+        plasma_psi: Float64[JaxArray, "batch 1 nx ny"],
+        tokamak_psi: Float64[JaxArray, "batch 1 nx ny"],
+        R0: Float64[JaxArray, "batch 1 nx ny"],
+        constraints: Float64[JaxArray, "batch n_params"],
+        Q: Float64[JaxArray, "batch nx*ny output_dim"], 
+        ) -> Float64[JaxArray, ""]:
 
-        return loss
+        model = eqx.combine(params, static)
+        psi = jnp.concatenate([plasma_psi, tokamak_psi, R0], axis=1)
+
+        vmap_model = vmap(model)
+        output = vmap_model(psi, constraints)
+        output = jnp.permute_dims(output, (0, 2, 3, 1)).reshape(
+            -1, self.nR * self.nZ, self.output_dim
+            )
+        Q_pred, _ = jnp.linalg.qr(output, mode='reduced')
+        col_norms = jnp.linalg.norm(Q, axis=1)
+        mask = (col_norms > 1e-6)
+        Q_mask = jnp.where((col_norms > 1e-6)[:, None, :], Q, 0)
+        C = jnp.einsum('bni, bnj -> bij', Q_mask, Q_pred)
+        r = jnp.sum(mask, axis=1)
+        loss = jnp.sum(r - jnp.sum(C ** 2, axis=(1, 2)))
+        aux = 0.0
+        return loss, (jnp.mean(jnp.sum(C ** 2, axis=(2, ))[:, 0]), jnp.mean(jnp.sum(C ** 2, axis=(2, ))[:, 1])) 
+
 
     @eqx.filter_jit(donate="all")
     def make_step(
@@ -1154,37 +1190,30 @@ class Trainer_g:
         opt_state: optax.OptState,
         plasma_psi: Float64[JaxArray, "B 1 nx ny"],
         tokamak_psi: Float64[JaxArray, "B 1 nx ny"],
+        R0: Float64[JaxArray, "B 1 nx ny"],
         constraints: Float64[JaxArray, "B n_params"],
+        Q: Float64[JaxArray, "B nx*ny"],
         G: Float64[JaxArray, "B nx*ny"],
         grad_transf: optax.GradientTransformation,
-        sharding: jax.sharding.NamedSharding,
-        sharding_model: jax.sharding.NamedSharding
-        ) -> Tuple[NKDeepONet, optax.OptState, float]:
-
-        model, opt_state = eqx.filter_shard((model, opt_state), sharding_model)
-        plasma_psi, tokamak_psi, constraints, G = eqx.filter_shard(
-            (plasma_psi, tokamak_psi, constraints, G), sharding
-        )
+        ) -> Tuple[NKDeepONet, optax.OptState, Tuple]:
 
         params, static = eqx.partition(model, eqx.is_array)
-        def value_fn(param: JaxArray) -> float:
-            if self.use_nk_loss:
+        if self.use_nk_loss:
+            def value_fn(param: JaxArray) -> float:
                 return self.loss_nk(
-                    param, static, plasma_psi, tokamak_psi, constraints, G
+                    param, static, plasma_psi, tokamak_psi, R0, constraints, G
                 )
-            else:
-                return self.loss(
-                    param, static, plasma_psi, tokamak_psi, constraints
+        else:
+            def value_fn(param: JaxArray) -> float:
+                return self.loss_data_2(
+                    param, static, plasma_psi, tokamak_psi, R0, constraints, Q
                     )
-            # return self.loss_data(
-            #     param, static, plasma_psi, tokamak_psi, constraints, updates_psi
-            #     )
-        
-        value, grads = eqx.filter_value_and_grad(value_fn)(params)
+        (value, aux), grads = eqx.filter_value_and_grad(value_fn, has_aux=True)(params)
         updates, opt_state = grad_transf.update(grads, opt_state, params)
         model = eqx.apply_updates(model, updates)
 
-        return eqx.filter_shard((model, opt_state), sharding_model), value
+        return model, opt_state, (value, aux)
+        
     
     def load(self, model: eqx.Module, load_name: Dict[int, str]) -> None:
         load_path = os.path.join(
@@ -1510,7 +1539,7 @@ class Trainer_separatrix:
         fp = jnp.sum((labels == 0) & (predict_labels == 0))
         fn = jnp.sum((labels == 0) & (predict_labels == 1))
 
-        loss_recon = jnp.sum(((psi_recon - reconstruction)) ** 2, axis=0)
+        loss_recon = jnp.sum(((psi_recon_scaling - reconstruction)) ** 2, axis=0)
         loss_recon_axis, loss_recon_bdry = loss_recon[0], loss_recon[1]
         return loss_recon_axis, loss_recon_bdry, tp, tn, fp, fn
 
