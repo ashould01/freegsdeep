@@ -352,41 +352,41 @@ class PINTO_jax(eqx.Module):
         self.pos_encoder = eqx.nn.Sequential((
             eqx.nn.Linear(2, 64, key=key11),
             eqx.nn.Lambda(jax.nn.silu),
-            eqx.nn.Linear(64, 20, key=key12)
+            eqx.nn.Linear(64, 30, key=key12)
         ))
         key21, key22 = jax.random.split(key2, 2)
         key_encoder = eqx.nn.Sequential((
             eqx.nn.Linear(2, 64, key=key21),
             eqx.nn.Lambda(jax.nn.silu),
-            eqx.nn.Linear(64, 20, key=key22)
+            eqx.nn.Linear(64, 30, key=key22)
         ))
         self.key_encoder = eqx.filter_vmap(key_encoder)
         key31, key32 = jax.random.split(key3, 2)
         value_encoder = eqx.nn.Sequential((
             eqx.nn.Linear(1, 64, key=key31),
             eqx.nn.Lambda(jax.nn.silu),
-            eqx.nn.Linear(64, 20, key=key32)
+            eqx.nn.Linear(64, 30, key=key32)
         ))
         self.value_encoder = eqx.filter_vmap(value_encoder)
-        self.MHA1 = eqx.nn.MultiheadAttention(num_heads=2, query_size=20, key=key4)
+        self.MHA1 = eqx.nn.MultiheadAttention(num_heads=2, query_size=30, key=key4)
         key51, key52 = jax.random.split(key5, 2)
         mlp2 = eqx.nn.Sequential((
-            eqx.nn.Linear(20, 64, key=key51),
+            eqx.nn.Linear(30, 64, key=key51),
             eqx.nn.Lambda(jax.nn.silu),
-            eqx.nn.Linear(64, 20, key=key52)
+            eqx.nn.Linear(64, 30, key=key52)
         ))
         self.mlp2 = eqx.filter_vmap(mlp2)
-        self.MHA3 = eqx.nn.MultiheadAttention(num_heads=2, query_size=20, key=key6)
+        self.MHA3 = eqx.nn.MultiheadAttention(num_heads=2, query_size=30, key=key6)
         key71, key72 = jax.random.split(key7, 2)
         mlp4 = eqx.nn.Sequential((
-            eqx.nn.Linear(20, 64, key=key71),
+            eqx.nn.Linear(30, 64, key=key71),
             eqx.nn.Lambda(jax.nn.silu),
-            eqx.nn.Linear(64, 20, key=key72)
+            eqx.nn.Linear(64, 30, key=key72)
         ))
         self.mlp4 = eqx.filter_vmap(mlp4)
         key81, key82 = jax.random.split(key8, 2)
         decoder = eqx.nn.Sequential((
-            eqx.nn.Linear(20, 64, key=key81),
+            eqx.nn.Linear(30, 64, key=key81),
             eqx.nn.Lambda(jax.nn.silu),
             eqx.nn.Linear(64, 1, key=key82)
         ))
@@ -488,9 +488,9 @@ class NKDeepONet(eqx.Module):
         self.branch_tokamak = eqx.nn.Sequential((
             eqx.nn.Linear(tokamak_input_len, 64, key=key31),
             eqx.nn.Lambda(jax.nn.relu),
-            eqx.nn.Linear(64, 32, key=key32),
+            eqx.nn.Linear(64, 64, key=key32),
             eqx.nn.Lambda(jax.nn.relu),
-            eqx.nn.Linear(32, hidden_dim, key=key33)
+            eqx.nn.Linear(64, hidden_dim, key=key33)
         ))
         key41, key42 = jax.random.split(key4, 2)
         self.mlp_output = eqx.nn.Sequential((

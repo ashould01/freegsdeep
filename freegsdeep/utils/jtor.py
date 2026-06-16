@@ -181,7 +181,7 @@ class ConstrainPaxisIp():
         )
 
         # store parameters
-        self.jtor = Jtor
+        self.jtor = np.asarray(Jtor)
         self.jtorshape = jtorshape
         return Jtor
 

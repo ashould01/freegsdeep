@@ -26,8 +26,8 @@ def main(initial_psi=None):
     )
     profiles = ConstrainPaxisIp(
         eq=eq,        # equilibrium object
-        paxis=8e3,    # profile object
-        Ip=6e5,       # plasma current
+        paxis=1e4,    # profile object
+        Ip=5e5,       # plasma current
         fvac=0.5,     # fvac = rB_{tor}
         alpha_m=1.8,  # profile function parameter
         alpha_n=1.2   # profile function parameter
@@ -50,26 +50,4 @@ def main(initial_psi=None):
         )
 
 if __name__ == "__main__":
-    data_psi = torch.load(
-        'data/data_debug_one_sample/psi_f.pt', map_location=torch.device('cpu'),
-        weights_only=True
-        )
-    data_F_psi = torch.load(
-        'data/data_debug_one_sample/res0_f.pt', map_location=torch.device('cpu'),
-        weights_only=True
-    )
-    data_psi = np.stack(data_psi.numpy(), axis=1)
-    data_F_psi = np.stack(data_F_psi.numpy(), axis=1)
-    mean_x = np.mean(data_psi, axis=1, keepdims=True)
-    mean_f = np.mean(data_F_psi, axis=1, keepdims=True)
-    Xc = data_psi - mean_x
-    Fc = data_F_psi - mean_f
-    Ux, Sx, _ = np.linalg.svd(Xc, full_matrices=False)
-    Uf, Sf, _ = np.linalg.svd(Fc, full_matrices=False)
-    d = min(Ux.shape[1], Uf.shape[1], 10)
-
-    
-
-    breakpoint()
-    
     main()
