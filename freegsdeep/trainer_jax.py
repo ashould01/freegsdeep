@@ -1,5 +1,4 @@
 import os
-
 tex_bin = "/data1/home/ahn40200393/texlive/2025/bin/x86_64-linux"
 os.environ["PATH"] = tex_bin + ":" + os.environ.get("PATH", "")
 import matplotlib.pyplot as plt
@@ -20,7 +19,7 @@ import optax
 from freegsdeep.dataset import *
 from freegsdeep.model import *
 from jaxtyping import Float64
-from freegsdeep.typing import *
+from freegsdeep.utils.typing import *
 from freegsdeep.utils import ellipk, ellipe, break_if_nan
 from freegsnke import build_machine, equilibrium_update, limiter_func
 
@@ -48,7 +47,7 @@ class Trainer_f:
 
         self.dataset = GSrhsdatasetMASTU_f(
             Rmin=Rmin, Rmax=Rmax, Zmin=Zmin, Zmax=Zmax,
-            nR=nR, nZ=nZ, num=len_data, max_iter=150,
+            nR=nR, nZ=nZ, num=len_data, max_iter=50,
             load_path=data_load_path, save_path=data_save_path
         )
 
@@ -63,7 +62,8 @@ class Trainer_f:
 
         model = Integratednet_jax(
             Rmin=self.Rmin, Rmax=self.Rmax, Zmin=self.Zmin, Zmax=self.Zmax,
-            nx=self.nR, ny=self.nZ, hidden_dim=15, key=jax.random.PRNGKey(0)
+            nx=self.nR, ny=self.nZ, hidden_dim=30, key=jax.random.PRNGKey(0),
+            freqs=5
             )
         save_path, train_dataloader, test_dataloader, model, load_epoch = \
             self.preprocess(model, save_name, load_name)
@@ -85,9 +85,11 @@ class Trainer_f:
         params_bdry = eqx.filter(model.bdry_net, eqx.is_array)
         opt_state_resi = optim_resi.init(params_resi)
         opt_state_bdry = optim_bdry.init(params_bdry)
+        self.train_loss = []
+        self.test_loss = []
         for epoch in range(load_epoch, self.adam_epoch):
             loss = 0.0
-            loss_list = []
+            loss_list_step = []
             num_data = 0
             for _i, batch in enumerate(train_dataloader):
                 idx, rhs, bdry, soln = batch
@@ -100,20 +102,21 @@ class Trainer_f:
                         rhs, bdry, optim_resi, optim_bdry,
                         lbfgs=False
                         )
-                loss_list.append([loss_resi, loss_bdry])
+                loss_list_step.append([loss_resi, loss_bdry])
                 if (_i + 1) % 200 == 0:
                     print(f'Step {_i+1} | Loss: resi {loss_resi:.6e} + '\
                         f'bdry {loss_bdry:.6e} = {loss_resi+loss_bdry:.6e}'
                         )
                 num_data += rhs.shape[0]
 
-            loss_list = np.array(loss_list)
-            loss = np.sum(loss_list, axis=0) / num_data
+            loss_list_step = np.array(loss_list_step)
+            loss_step = np.sum(loss_list_step, axis=0) / num_data
+            self.train_loss.append(loss_step)
             print(
                 f"Epoch {epoch} train | " \
-                f"Loss: resi {jnp.sqrt(loss[0]):.6e} + "\
-                f"bdry {jnp.sqrt(loss[1]):.6e} = " \
-                f"{jnp.sqrt(loss[0])+jnp.sqrt(loss[1]):.6e}"
+                f"Loss: resi {jnp.sqrt(loss_step[0]):.6e} + "\
+                f"bdry {jnp.sqrt(loss_step[1]):.6e} = " \
+                f"{jnp.sqrt(loss_step[0])+jnp.sqrt(loss_step[1]):.6e}"
                 )
         
             test_abs_loss = 0.0
@@ -125,13 +128,15 @@ class Trainer_f:
                 rhs = jnp.asarray(rhs).reshape(-1, 1, self.nR, self.nZ)
                 bdry = jnp.asarray(bdry)[:, :, None]
                 soln = jnp.asarray(soln)[:, :, None]
-                test_abs_loss_batch, test_rel_loss_batch = \
+                test_abs_loss_step, test_rel_loss_step, predict, soln = \
                     self.compute_test_loss(
                         model, rhs, bdry, soln
                 )
-                test_abs_loss += test_abs_loss_batch
-                test_rel_loss += test_rel_loss_batch
+                test_abs_loss += test_abs_loss_step
+                test_rel_loss += test_rel_loss_step
                 num_test += rhs.shape[0]
+                if (epoch + 1) % 50 == 0:
+                    self.image(epoch, _i, predict, soln, save_path)
 
             test_abs_loss /= num_test 
             test_rel_loss /= num_test
@@ -139,7 +144,9 @@ class Trainer_f:
                 f'Epoch {epoch} test | abs : {np.sqrt(test_abs_loss)} ' \
                 f'rel : {np.sqrt(test_rel_loss)}'
                 )
-            self.save(model, epoch, save_path)
+            self.test_loss.append([test_abs_loss, test_rel_loss])
+            if (epoch + 1) % 10 == 0:
+                self.save(model, epoch, save_path)
 
         print("Phase 2 : L-BFGS optimization")
         linesearch_fn = optax.scale_by_zoom_linesearch(max_linesearch_steps=20)
@@ -193,10 +200,10 @@ class Trainer_f:
                 rhs = jnp.asarray(rhs).reshape(-1, 1, self.nR, self.nZ)
                 bdry = jnp.asarray(bdry)[:, :, None]
                 soln = jnp.asarray(soln)[:, :, None]
-                test_abs_loss_batch, test_rel_loss_batch = \
+                test_abs_loss_batch, test_rel_loss_batch, predict, soln = \
                     self.compute_test_loss(
                         model, rhs, bdry, soln
-                )
+                        )
                 test_abs_loss += test_abs_loss_batch
                 test_rel_loss += test_rel_loss_batch
                 num_test += rhs.shape[0]
@@ -207,7 +214,8 @@ class Trainer_f:
                 f'Epoch {epoch} test | abs : {jnp.sqrt(test_abs_loss)} ' \
                 f'rel : {jnp.sqrt(test_rel_loss)}'
                 )
-            self.save(model, epoch, save_path)
+            if (epoch + 1) % 10 == 0:
+                self.save(model, epoch, save_path)
 
     def preprocess(
         self, model: eqx.Module, save_name: str,
@@ -228,7 +236,8 @@ class Trainer_f:
                 self.dataset, [train_size, test_size]
                 )
             del_idx = torch.where(
-                self.dataset.idx_f[1:] != self.dataset.idx_f[:-1]
+                torch.tensor(self.dataset.idx_f[1:]) != \
+                    torch.tensor(self.dataset.idx_f[:-1])
                 )[0]
             new_idx = [
                 idx for idx in test_dataset.indices if idx not in del_idx
@@ -255,7 +264,7 @@ class Trainer_f:
         rhs: Float64[JaxArray, "B 1 nx ny"],
         bdry: Float64[JaxArray, "B 2*nx+2*ny 1"],
         soln: Float64[JaxArray, "B 1 nx ny"],
-        ) -> Tuple[float, float]:
+        ) -> Tuple[float, float, Float64[JaxArray, "nx ny"], Float64[JaxArray, "nx ny"]]:
                 
         predict = vmap(
             vmap(model, in_axes=(0, 0, None, None, None)),
@@ -274,7 +283,8 @@ class Trainer_f:
             axis=(1, 2)
         ))
         
-        return test_abs_loss, test_rel_loss
+        return test_abs_loss, test_rel_loss, predict[0].reshape(self.nR, self.nZ), \
+            soln[0].reshape(self.nR, self.nZ)
 
     def transformation(self, R: JaxArray, Z: JaxArray) -> Tuple[JaxArray, JaxArray]:
         x = (R - self.Rmin) / (self.Rmax - self.Rmin)
@@ -284,143 +294,52 @@ class Trainer_f:
     def loss_resi(
         self, params: JaxArray, static, rhs: Float64[JaxArray, "batch nx*ny"],
         ) -> Float64[JaxArray, ""]:
-        
-        model = eqx.combine(params, static)
 
+        model = eqx.combine(params, static)
         scaling = rhs.max(axis=(2, 3), keepdims=True) - \
             rhs.min(axis=(2, 3), keepdims=True)
         rhs = rhs / scaling
-
         R = self.resi[:, 0:1] # (nx*ny, )
         Z = self.resi[:, 1:2] # (nx*ny, )
         x, y = self.transformation(R, Z)
 
-        grad_x = jacfwd(model.trunk, 0)
-        grad_y = jacfwd(model.trunk, 1)
-        grad_xx = jacfwd(grad_x, 0)
-        grad_yy = jacfwd(grad_y, 1)
-        grad_h = jacrev(model.output_mlp, 0)
-        hessian_h = hessian(model.output_mlp, 0)
-        
-        output_branch = vmap(model.branch)(rhs)
-        output_trunk = vmap(model.trunk)(x, y)
-        do_dh = vmap(
-            vmap(grad_h, in_axes=(0, None)),
-            in_axes=(None, 0))(output_trunk, output_branch) 
-        # (B, nx*ny, 1, 15)
-        d2o_dh2 = vmap(
-            vmap(hessian_h, in_axes=(0, None)),
-            in_axes=(None, 0))(output_trunk, output_branch) 
-        # (B, nx*ny, 1, 15, 15)
-        dh_dx = vmap(grad_x)(x, y)
-        # (nx*ny, 15, 1)
-        dh_dy = vmap(grad_y)(x, y)
-        # (nx*ny, 15, 1)
-        dh2_dx2 = vmap(grad_xx)(x, y)
-        # (nx*ny, 15, 1, 1)
-        dh2_dy2 = vmap(grad_yy)(x, y)
-        # (nx*ny, 15, 1, 1)
-        do_dx = jnp.einsum('bxij, xji -> bx', do_dh, dh_dx)
-        # (B, nx*ny)
-        d2o_dx2 = jnp.einsum('bxkij, xik, xjk -> bx', d2o_dh2, dh_dx, dh_dx) + \
-            jnp.einsum('bxij, xjik -> bx', do_dh, dh2_dx2)
-        # (B, nx*ny)
-        d2o_dy2 = jnp.einsum('bxkij, xik, xjk -> bx', d2o_dh2, dh_dy, dh_dy) + \
-            jnp.einsum('bxij, xjik -> bx', do_dh, dh2_dy2)
-        # (B, nx*ny)
+        def hat_psi(x, y, rhs, model):
+            zero = jnp.zeros_like(x, dtype=jnp.float64)
+            one = jnp.ones_like(x, dtype=jnp.float64)
+            lb = model(x, zero, rhs) + model(zero, y, rhs) - \
+                model(zero, zero, rhs)
+            rb = model(x, zero, rhs) + model(one, y, rhs) - \
+                model(one, zero, rhs)
+            rt = model(one, y, rhs) + model(x, one, rhs) - \
+                model(one, one, rhs)
+            lt = model(zero, y, rhs) + model(x, one, rhs) - \
+                model(zero, one, rhs)
+            return model(x, y, rhs) - ((1 - x) * (1 - y) * lb + x * (1 - y) * rb + \
+                x * y * rt + (1 - x) * y * lt)
+        grad_x = jacrev(hat_psi, 0)
+        grad_y = jacrev(hat_psi, 1)
+        grad_xx = jacrev(grad_x, 0)
+        grad_yy = jacrev(grad_y, 1)
+        do_dx = vmap(vmap(
+            grad_x, in_axes=(0, 0, None, None)
+            ), in_axes=(None, None, 0, None))(x, y, rhs, model).squeeze(3)
+        d2o_dx2 = vmap(vmap(
+            grad_xx, in_axes=(0, 0, None, None)
+            ), in_axes=(None, None, 0, None))(x, y, rhs, model).squeeze(4).squeeze(3)
+        d2o_dy2 = vmap(vmap(
+            grad_yy, in_axes=(0, 0, None, None)
+            ), in_axes=(None, None, 0, None))(x, y, rhs, model).squeeze(4).squeeze(3)
 
         dx_dr = 1 / (self.Rmax - self.Rmin)
         dy_dz = 1 / (self.Zmax - self.Zmin)
-
-        zero = jnp.zeros_like(x, dtype=jnp.float64)
-        one = jnp.ones_like(x, dtype=jnp.float64)
-        output_trunk_0y = vmap(model.trunk)(zero, y)
-        output_trunk_1y = vmap(model.trunk)(one, y)
-        output_trunk_x0 = vmap(model.trunk)(x, zero)
-        output_trunk_x1 = vmap(model.trunk)(x, one)
-
-        dl_dh_0y = vmap(
-            vmap(grad_h, in_axes=(0, None)),
-            in_axes=(None, 0))(output_trunk_0y, output_branch)
-        dl_dh_1y = vmap(
-            vmap(grad_h, in_axes=(0, None)),
-            in_axes=(None, 0))(output_trunk_1y, output_branch)
-        dl_dh_x0 = vmap(
-            vmap(grad_h, in_axes=(0, None)),
-            in_axes=(None, 0))(output_trunk_x0, output_branch)
-        dl_dh_x1 = vmap(
-            vmap(grad_h, in_axes=(0, None)),
-            in_axes=(None, 0))(output_trunk_x1, output_branch)
-
-        dh_dx_x0 = vmap(grad_x)(x, zero)
-        dh_dx_x1 = vmap(grad_x)(x, one)
-        dh_dy_0y = vmap(grad_y)(zero, y)
-        dh_dy_1y = vmap(grad_y)(one, y)
-
-        dl_dx_x0 = jnp.einsum('bxij, xji -> bx', dl_dh_x0, dh_dx_x0)
-        dl_dx_x1 = jnp.einsum('bxij, xji -> bx', dl_dh_x1, dh_dx_x1)
-
-        d2l_dh2_0y = vmap(
-            vmap(hessian_h, in_axes=(0, None)), in_axes=(None, 0)
-        )(output_trunk_0y, output_branch)
-        d2l_dh2_1y = vmap(
-            vmap(hessian_h, in_axes=(0, None)), in_axes=(None, 0)
-        )(output_trunk_1y, output_branch)
-        d2l_dh2_x0 = vmap(
-            vmap(hessian_h, in_axes=(0, None)), in_axes=(None, 0)
-        )(output_trunk_x0, output_branch)
-        d2l_dh2_x1 = vmap(
-            vmap(hessian_h, in_axes=(0, None)), in_axes=(None, 0)
-        )(output_trunk_x1, output_branch)
-
-        dh2_dx2_x0 = vmap(grad_xx)(x, zero)
-        dh2_dx2_x1 = vmap(grad_xx)(x, one)
-        dh2_dy2_0y = vmap(grad_yy)(zero, y)
-        dh2_dy2_1y = vmap(grad_yy)(one, y)
-
-        d2l_dx2_x0 = jnp.einsum(
-            'bxkij, xik, xjk -> bx', d2l_dh2_x0, dh_dx_x0, dh_dx_x0
-            ) + jnp.einsum(
-                'bxij, xjik -> bx', dl_dh_x0, dh2_dx2_x0
+        resi = (
+            - 1 / R[None, ...] * do_dx * dx_dr + d2o_dx2 * dx_dr ** 2 + d2o_dy2 * dy_dz ** 2
             )
-        d2l_dx2_x1 = jnp.einsum(
-            'bxkij, xik, xjk -> bx', d2l_dh2_x1, dh_dx_x1, dh_dx_x1
-            ) + jnp.einsum(
-                'bxij, xjik -> bx', dl_dh_x1, dh2_dx2_x1
-            )
-        d2l_dy2_0y = jnp.einsum(
-            'bxkij, xik, xjk -> bx', d2l_dh2_0y, dh_dy_0y, dh_dy_0y
-            ) + jnp.einsum(
-                'bxij, xjik -> bx', dl_dh_0y, dh2_dy2_0y
-            )
-        d2l_dy2_1y = jnp.einsum(
-            'bxkij, xik, xjk -> bx', d2l_dh2_1y, dh_dy_1y, dh_dy_1y
-            ) + jnp.einsum(
-                'bxij, xjik -> bx', dl_dh_1y, dh2_dy2_1y
-            )
-        
-        o_f = lambda x, y, rhs: vmap(vmap(
-            model, in_axes=(0, 0, None)
-            ), in_axes=(None, None, 0))(x, y, rhs).squeeze(2)
-
-        x_t = jnp.permute_dims(x, (1, 0))
-        y_t = jnp.permute_dims(y, (1, 0))
-
-        dl_dx = o_f(one, y, rhs) - o_f(zero, y, rhs) + (1 - y_t) * (
-            o_f(zero, zero, rhs) - o_f(one, zero, rhs)
-        ) + y_t * (o_f(one, one, rhs) - o_f(zero, one, rhs)) + \
-            (1 - y_t) * dl_dx_x0 + y_t * dl_dx_x1
-        d2l_dx2 = (1 - y_t) * d2l_dx2_x0 + y_t * d2l_dx2_x1
-        d2l_dy2 = (1 - x_t) * d2l_dy2_0y + x_t * d2l_dy2_1y
-
-        dpsi_dR = (do_dx - dl_dx) * dx_dr
-        d2psi_dR2 = (d2o_dx2 - d2l_dx2) * dx_dr ** 2
-        d2psi_dZ2 = (d2o_dy2 - d2l_dy2) * dy_dz ** 2
-
         psi_loss = jnp.sum(jnp.mean((
-            d2psi_dR2 + d2psi_dZ2 - dpsi_dR / R[None, :, 0] - \
-                rhs.reshape(rhs.shape[0], -1)
-        ) ** 2, axis=1))
+            (resi.reshape(resi.shape[0], self.nR, self.nZ) - \
+                rhs.squeeze(1)) ** 2 / R.reshape(1, self.nR, self.nZ))[:, 1:-1, 1:-1],
+            axis=(1, 2)
+            ))
 
         return psi_loss
 
@@ -470,7 +389,7 @@ class Trainer_f:
             )(self.bdry[:, 0:1], self.bdry[:, 1:2], self.bdry, bdry_value)
         psi_bdry = psi_bdry[:, :, :, 0]
         psi_bdry_loss = jnp.sum(jnp.mean((psi_bdry - bdry_value) ** 2, axis=(1, 2)))
-        return psi_resi_loss + 30 * psi_bdry_loss, (psi_resi_loss, psi_bdry_loss)
+        return 1 / 31 * psi_resi_loss + 30 / 31 * psi_bdry_loss, (psi_resi_loss, psi_bdry_loss)
         # return psi_resi_loss, (psi_resi_loss, psi_bdry_loss)
     
     @eqx.filter_jit
@@ -562,19 +481,29 @@ class Trainer_f:
                 ), train_dataset, test_dataset
             
             
-    def save(self, model: eqx.Module, epoch: int, save_path: str) -> None:
+    def save(
+        self, model: eqx.Module, epoch: int, save_path: str
+        ) -> None:
         save_path = os.path.join(save_path, 'model')
         os.makedirs(
             save_path, exist_ok=True
         )
-        save_path = os.path.join(
+        save_path_loss = os.path.join(
+            save_path, f'loss.npz'
+        )
+        np.savez(
+            save_path_loss,
+            train_loss=np.array(self.train_loss),
+            test_loss=np.array(self.test_loss)
+            )
+        save_path_model = os.path.join(
             save_path, f'model_{epoch}.eqx'
         )
-        with open(save_path, 'wb') as f:
+        with open(save_path_model, 'wb') as f:
             eqx.tree_serialise_leaves(f, model)
 
     def image(
-        self, epoch: int, predict: JaxArray, soln: JaxArray, save_path: str
+        self, epoch: int, subepoch: int, predict: JaxArray, soln: JaxArray, save_path: str
     ) -> None:
         R = jnp.linspace(self.Rmin, self.Rmax, self.nR)
         Z = jnp.linspace(self.Zmin, self.Zmax, self.nZ)
@@ -619,7 +548,7 @@ class Trainer_f:
         save_path = os.path.join(save_path, 'images')
         os.makedirs(save_path, exist_ok=True)
         fig.savefig(
-            os.path.join(save_path, f'epoch_{epoch}.png'),
+            os.path.join(save_path, f'epoch_{epoch}_{subepoch}.png'),
             bbox_inches='tight'
             )
         plt.close()
@@ -650,7 +579,7 @@ class Trainer_g:
 
         self.dataset = GSrhsdatasetMASTU_g(
             Rmin=Rmin, Rmax=Rmax, Zmin=Zmin, Zmax=Zmax,
-            nR=nR, nZ=nZ, num=len_data, max_iter=150,
+            nR=nR, nZ=nZ, num=len_data, max_iter=50,
             load_path=data_load_path, save_path=data_save_path
         )
         self.resi = jnp.asarray(self.dataset.residual)
@@ -828,7 +757,7 @@ class Trainer_g:
                 f"Epoch {epoch} train | " \
                 f"Loss: {jnp.sqrt(loss):.6e}"
                 )
-            if (epoch + 1) % 10 == 0:
+            if (epoch + 1) % 1 == 0:
                 self.save(model, epoch, save_path)
 
             for _i, batch in enumerate(test_dataloader):

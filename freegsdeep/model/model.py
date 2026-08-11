@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from freegsdeep.typing import *
-from typing import Tuple
+from freegsdeep.utils.typing import *
+from typing import Any, Tuple
 
 class Waveact(nn.Module):
     def __init__(self) -> None:
@@ -225,13 +225,15 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 
+JAX_DTYPE = jnp.float64
+
 class Waveact_jax(eqx.Module):
     w1: JaxArray
     w2: JaxArray
 
-    def __init__(self) -> None:
-        self.w1 = jnp.ones((1, ), dtype=jnp.float64)
-        self.w2 = jnp.ones((1, ), dtype=jnp.float64)
+    def __init__(self, dtype: Any = JAX_DTYPE) -> None:
+        self.w1 = jnp.ones((1, ), dtype=dtype)
+        self.w2 = jnp.ones((1, ), dtype=dtype)
     def __call__(self, x: JaxArray) -> JaxArray:
         return self.w1 * jnp.sin(x) + self.w2 * jnp.cos(x)
 
@@ -241,16 +243,22 @@ class Trunk(eqx.Module):
     layer2: eqx.nn.Linear
     act2: Waveact_jax
     layer3: eqx.nn.Linear
+    w: JaxArray
 
-    def __init__(self, hidden_dim: int, key) -> None:
-        key1, key2, key3 = jax.random.split(key, 3)
-        self.layer1 = eqx.nn.Linear(2, 64, key=key1, dtype=jnp.float64)
-        self.act1 = Waveact_jax()
-        self.layer2 = eqx.nn.Linear(64, 64, key=key2, dtype=jnp.float64)
-        self.act2 = Waveact_jax()
-        self.layer3 = eqx.nn.Linear(64, hidden_dim, key=key3, dtype=jnp.float64)
+    def __init__(
+        self, hidden_dim: int, key: jax.random.PRNGKey, freqs: int = 5,
+        dtype: Any = JAX_DTYPE
+        ) -> None:
+        key1, key2, key3, key4 = jax.random.split(key, 4)        
+        self.layer1 = eqx.nn.Linear(64, 64, key=key1, dtype=dtype)
+        self.act1 = Waveact_jax(dtype)
+        self.layer2 = eqx.nn.Linear(64, 64, key=key2, dtype=dtype)
+        self.act2 = Waveact_jax(dtype)
+        self.layer3 = eqx.nn.Linear(64, hidden_dim, key=key3, dtype=dtype)
+        self.w = freqs * jax.random.normal(key4, (2, 32), dtype=dtype)
     def __call__(self, R: JaxArray, Z: JaxArray) -> JaxArray:
         x = jnp.concatenate((R, Z), axis=0)
+        x = jnp.hstack((jnp.sin(self.w.T @ x), jnp.cos(self.w.T @ x)))
         x = self.layer1(x)
         x = self.act1(x)
         x = self.layer2(x)
@@ -263,36 +271,36 @@ class Branch(eqx.Module):
 
     def __init__(
         self, input_channel: int, hidden_dim: int,
-        nx: int, ny: int, key) -> None:
+        nx: int, ny: int, key, dtype: Any = JAX_DTYPE) -> None:
         key_conv, key_linear = jax.random.split(key, 2)
         key11, key12, key13 = jax.random.split(key_conv, 3)
         key21, key22, key23 = jax.random.split(key_linear, 3)
         
         self.layers = eqx.nn.Sequential((
             eqx.nn.Conv2d(
-                input_channel, 16, kernel_size=3, padding=1,
-                key=key11, dtype=jnp.float64
+                input_channel, 32, kernel_size=3, padding=1,
+                key=key11, dtype=dtype
                 ),
             eqx.nn.MaxPool2d(kernel_size=2, stride=2),
             eqx.nn.Lambda(jax.nn.relu),
             eqx.nn.Conv2d(
-                16, 32, kernel_size=3, padding=1, key=key12, dtype=jnp.float64
+                32, 32, kernel_size=3, padding=1, key=key12, dtype=dtype
                 ),
             eqx.nn.MaxPool2d(kernel_size=2, stride=2),
             eqx.nn.Lambda(jax.nn.relu),
             eqx.nn.Conv2d(
-                32, 64, kernel_size=3, padding=1, key=key13, dtype=jnp.float64
+                32, 64, kernel_size=3, padding=1, key=key13, dtype=dtype
                 ),
             eqx.nn.MaxPool2d(kernel_size=2, stride=2),
             eqx.nn.Lambda(jax.nn.relu),
             eqx.nn.Lambda(jnp.ravel),
             eqx.nn.Linear(
-                64 * (nx // 8) * (ny // 8), 256, key=key21, dtype=jnp.float64
+                64 * (nx // 8) * (ny // 8), 256, key=key21, dtype=dtype
                 ),
             eqx.nn.Lambda(jax.nn.relu),
-            eqx.nn.Linear(256, 64, key=key22, dtype=jnp.float64),
+            eqx.nn.Linear(256, 64, key=key22, dtype=dtype),
             eqx.nn.Lambda(jax.nn.relu),
-            eqx.nn.Linear(64, hidden_dim, key=key23, dtype=jnp.float64),
+            eqx.nn.Linear(64, hidden_dim, key=key23, dtype=dtype),
         ))
 
     def __call__(self, x: JaxArray) -> JaxArray:
@@ -302,11 +310,11 @@ class MLP_output(eqx.Module):
     layer1: eqx.nn.Linear
     act1: callable
     layer2: eqx.nn.Linear
-    def __init__(self, hidden_dim: int, key) -> None:
+    def __init__(self, hidden_dim: int, key, dtype: Any = JAX_DTYPE) -> None:
         key1, key2 = jax.random.split(key, 2)
-        self.layer1 = eqx.nn.Linear(hidden_dim * 2, 64, key=key1, dtype=jnp.float64)
-        self.act1 = Waveact_jax()
-        self.layer2 = eqx.nn.Linear(64, 1, key=key2, dtype=jnp.float64)
+        self.layer1 = eqx.nn.Linear(hidden_dim * 2, 64, key=key1, dtype=dtype)
+        self.act1 = Waveact_jax(dtype)
+        self.layer2 = eqx.nn.Linear(64, 1, key=key2, dtype=dtype)
     def __call__(self, trunk: JaxArray, branch: JaxArray) -> JaxArray:
         x = jnp.concatenate((trunk, branch), axis=0)
         x = self.layer1(x)
@@ -321,12 +329,15 @@ class DeepONet_resi_jax(eqx.Module):
     trunk: Trunk
     branch: Branch
     output_mlp: MLP_output
-    def __init__(self, nx: int, ny: int, hidden_dim: int, key) -> None:
+    def __init__(
+        self, nx: int, ny: int, hidden_dim: int, key: jax.random.PRNGKey,
+        freqs: int, dtype: Any = JAX_DTYPE
+        ) -> None:
         key1, key2, key3 = jax.random.split(key, 3)
         self.nx, self.ny = nx, ny
-        self.trunk = Trunk(hidden_dim, key1)
-        self.branch = Branch(1, hidden_dim, nx, ny, key2)
-        self.output_mlp = MLP_output(hidden_dim, key3)
+        self.trunk = Trunk(hidden_dim, key1, freqs, dtype)
+        self.branch = Branch(1, hidden_dim, nx, ny, key2, dtype)
+        self.output_mlp = MLP_output(hidden_dim, key3, dtype)
     
     def __call__(
         self, R: JaxArray, Z: JaxArray, rhs: JaxArray
@@ -346,49 +357,49 @@ class PINTO_jax(eqx.Module):
     mlp4: eqx.nn.Sequential
     decoder: eqx.nn.Sequential
     
-    def __init__(self, key) -> None:
+    def __init__(self, key, dtype: Any = JAX_DTYPE) -> None:
         key1, key2, key3, key4, key5, key6, key7, key8 = jax.random.split(key, 8)
         key11, key12 = jax.random.split(key1, 2)
         self.pos_encoder = eqx.nn.Sequential((
-            eqx.nn.Linear(2, 64, key=key11),
+            eqx.nn.Linear(2, 64, key=key11, dtype=dtype),
             eqx.nn.Lambda(jax.nn.silu),
-            eqx.nn.Linear(64, 30, key=key12)
+            eqx.nn.Linear(64, 30, key=key12, dtype=dtype)
         ))
         key21, key22 = jax.random.split(key2, 2)
         key_encoder = eqx.nn.Sequential((
-            eqx.nn.Linear(2, 64, key=key21),
+            eqx.nn.Linear(2, 64, key=key21, dtype=dtype),
             eqx.nn.Lambda(jax.nn.silu),
-            eqx.nn.Linear(64, 30, key=key22)
+            eqx.nn.Linear(64, 30, key=key22, dtype=dtype)
         ))
         self.key_encoder = eqx.filter_vmap(key_encoder)
         key31, key32 = jax.random.split(key3, 2)
         value_encoder = eqx.nn.Sequential((
-            eqx.nn.Linear(1, 64, key=key31),
+            eqx.nn.Linear(1, 64, key=key31, dtype=dtype),
             eqx.nn.Lambda(jax.nn.silu),
-            eqx.nn.Linear(64, 30, key=key32)
+            eqx.nn.Linear(64, 30, key=key32, dtype=dtype)
         ))
         self.value_encoder = eqx.filter_vmap(value_encoder)
         self.MHA1 = eqx.nn.MultiheadAttention(num_heads=2, query_size=30, key=key4)
         key51, key52 = jax.random.split(key5, 2)
         mlp2 = eqx.nn.Sequential((
-            eqx.nn.Linear(30, 64, key=key51),
+            eqx.nn.Linear(30, 64, key=key51, dtype=dtype),
             eqx.nn.Lambda(jax.nn.silu),
-            eqx.nn.Linear(64, 30, key=key52)
+            eqx.nn.Linear(64, 30, key=key52, dtype=dtype)
         ))
         self.mlp2 = eqx.filter_vmap(mlp2)
         self.MHA3 = eqx.nn.MultiheadAttention(num_heads=2, query_size=30, key=key6)
         key71, key72 = jax.random.split(key7, 2)
         mlp4 = eqx.nn.Sequential((
-            eqx.nn.Linear(30, 64, key=key71),
+            eqx.nn.Linear(30, 64, key=key71, dtype=dtype),
             eqx.nn.Lambda(jax.nn.silu),
-            eqx.nn.Linear(64, 30, key=key72)
+            eqx.nn.Linear(64, 30, key=key72, dtype=dtype)
         ))
         self.mlp4 = eqx.filter_vmap(mlp4)
         key81, key82 = jax.random.split(key8, 2)
         decoder = eqx.nn.Sequential((
-            eqx.nn.Linear(30, 64, key=key81),
+            eqx.nn.Linear(30, 64, key=key81, dtype=dtype),
             eqx.nn.Lambda(jax.nn.silu),
-            eqx.nn.Linear(64, 1, key=key82)
+            eqx.nn.Linear(64, 1, key=key82, dtype=dtype)
         ))
         self.decoder = eqx.filter_vmap(decoder)
     
@@ -422,17 +433,20 @@ class Integratednet_jax(eqx.Module):
     Zmax: float = eqx.field(static=True)
     nR: int = eqx.field(static=True)
     nZ: int = eqx.field(static=True)
+    dtype: Any = eqx.field(static=True)
 
     def __init__(
         self, Rmin: float, Rmax: float, Zmin: float, Zmax: float, 
-        nx: int, ny: int, hidden_dim: int, key
+        nx: int, ny: int, hidden_dim: int, key: jax.random.PRNGKey,
+        freqs: int, dtype: Any = JAX_DTYPE
         ) -> None:
         key1, key2 = jax.random.split(key, 2)
         self.Rmin, self.Rmax = Rmin, Rmax
         self.Zmin, self.Zmax = Zmin, Zmax
         self.nR, self.nZ = nx, ny
-        self.resi_net = DeepONet_resi_jax(nx, ny, hidden_dim, key1)
-        self.bdry_net = PINTO_jax(key2)
+        self.dtype = dtype
+        self.resi_net = DeepONet_resi_jax(nx, ny, hidden_dim, key1, freqs, dtype)
+        self.bdry_net = PINTO_jax(key2, dtype)
     
     def transformation(
         self, R: JaxArray, Z: JaxArray
@@ -442,16 +456,21 @@ class Integratednet_jax(eqx.Module):
         return x, y
     
     def lifting(self, x: JaxArray, y: JaxArray, rhs: JaxArray) -> JaxArray:
-        zero = jnp.zeros(1, dtype=jnp.float64)
-        one = jnp.ones(1, dtype=jnp.float64)
-        lb = self.resi_net(x, zero, rhs) + self.resi_net(zero, y, rhs) - \
-            self.resi_net(zero, zero, rhs)
-        rb = self.resi_net(x, zero, rhs) + self.resi_net(one, y, rhs) - \
-            self.resi_net(one, zero, rhs)
-        rt = self.resi_net(one, y, rhs) + self.resi_net(x, one, rhs) - \
-            self.resi_net(one, one, rhs)
-        lt = self.resi_net(zero, y, rhs) + self.resi_net(x, one, rhs) - \
-            self.resi_net(zero, one, rhs)
+        zero = jnp.zeros(1, dtype=self.dtype)
+        one = jnp.ones(1, dtype=self.dtype)
+        branch = self.resi_net.branch(rhs)
+        lb = self.resi_net.output_mlp(self.resi_net.trunk(x, zero), branch) + \
+            self.resi_net.output_mlp(self.resi_net.trunk(zero, y), branch) - \
+            self.resi_net.output_mlp(self.resi_net.trunk(zero, zero), branch)
+        rb = self.resi_net.output_mlp(self.resi_net.trunk(x, zero), branch) + \
+            self.resi_net.output_mlp(self.resi_net.trunk(one, y), branch) - \
+            self.resi_net.output_mlp(self.resi_net.trunk(one, zero), branch)
+        rt = self.resi_net.output_mlp(self.resi_net.trunk(one, y), branch) + \
+            self.resi_net.output_mlp(self.resi_net.trunk(x, one), branch) - \
+            self.resi_net.output_mlp(self.resi_net.trunk(one, one), branch)
+        lt = self.resi_net.output_mlp(self.resi_net.trunk(zero, y), branch) + \
+            self.resi_net.output_mlp(self.resi_net.trunk(x, one), branch) - \
+            self.resi_net.output_mlp(self.resi_net.trunk(zero, one), branch)
         return (1 - x) * (1 - y) * lb + x * (1 - y) * rb + \
             x * y * rt + (1 - x) * y * lt
         

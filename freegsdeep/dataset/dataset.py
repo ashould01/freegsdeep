@@ -1,7 +1,7 @@
 import os
 import pickle
 import torch
-import freegs.freegs as freegs
+# import freegs.freegs as freegs
 from freegs4e.multigrid import createVcycle
 from freegs4e.gradshafranov import GSsparse4thOrder
 from freegsnke import (
@@ -12,276 +12,9 @@ from freegsnke import (
 )
 import numpy as np
 from torch.utils.data import Dataset
-from freegs.freegs.gradshafranov import Greens
-from freegsdeep.typing import *
+from freegs4e.gradshafranov import Greens
+from freegsdeep.utils.typing import *
 from scipy.integrate import romb
-
-
-class GSrhsdataset(Dataset):
-    
-    def __init__(
-        self, Rmin: float, Rmax: float, Zmin: float, Zmax: float, 
-        nR: int, nZ: int, num: int, max_iter: int = 100,
-        load_path: Optional[str] = None, save_path: Optional[str] = None
-        ) -> None:
-
-        _R_resi = torch.from_numpy(np.linspace(Rmin, Rmax, nR))
-        _Z_resi = torch.from_numpy(np.linspace(Zmin, Zmax, nZ))
-        _R_resi, _Z_resi = torch.meshgrid(_R_resi, _Z_resi, indexing='ij')
-        _R_resi = _R_resi.reshape(-1)
-        _Z_resi = _Z_resi.reshape(-1)
-        _R_bdry = torch.from_numpy(np.linspace(Rmin, Rmax, nR))
-        _Z_bdry = torch.from_numpy(np.linspace(Zmin, Zmax, nZ))
-
-        self.residual = torch.tensor(
-            [[_R_resi[i], _Z_resi[i]] for i in range(nR * nZ)]
-            )
-        self.boundary_L = torch.tensor(
-            [[Rmin, _Z_bdry[i]] for i in range(nR)]
-        )
-        self.boundary_D = torch.tensor(
-            [[_R_bdry[i], Zmin] for i in range(nZ)]
-        )
-        self.boundary_R = torch.tensor(
-            [[Rmax, _Z_bdry[i]] for i in range(nR)]
-        )
-        self.boundary_U = torch.tensor(
-            [[_R_bdry[i], Zmax] for i in range(nZ)]
-        )
-        self.boundary = torch.concatenate([
-            self.boundary_L, self.boundary_D, self.boundary_R, self.boundary_U
-        ], dim=0)
-
-        if load_path is not None:
-            load_path = os.path.join('data', load_path)
-            self.idx_f = torch.load(os.path.join(load_path, 'index_f.pt'), weights_only=True)
-            self.rhs_f = torch.load(os.path.join(load_path, 'rhs_f.pt'), weights_only=True)
-            self.bdry_f = torch.load(os.path.join(load_path, 'bdry_f.pt'), weights_only=True)
-            self.psi_list_f = torch.load(os.path.join(load_path, 'psi_f.pt'), weights_only=True)
-            self.idx_g = torch.load(os.path.join(load_path, 'index_g.pt'), weights_only=True)
-            self.psi_g = torch.load(os.path.join(load_path, 'psi_g.pt'), weights_only=True)
-            self.R0_g = torch.load(os.path.join(load_path, 'R0_g.pt'), weights_only=True)
-            self.tokamak_psi_g = torch.load(os.path.join(load_path, 'tokamak_psi_g.pt'), weights_only=True)
-            self.constraint_g = torch.load(os.path.join(load_path, 'constraint_g.pt'), weights_only=True)
-            self.U = torch.load(os.path.join(load_path, 'U.pt'), weights_only=True)
-        else:
-            mu0 = 4e-7 * torch.pi
-            self.num = nR * nZ
-            self.idx = []
-            self.bdry_val_list = []
-            self.axis_val_list = []
-            self.psi_list = []
-            self.rhs = []
-            self.bdry = []
-            self.U = []
-            self.psi_coil_grid_list = []
-            self.psi_coil_x_list = []
-            self.psi_coil_isoflux_list = []
-            self.psi_coil_Br_list = []
-            self.psi_coil_Bz_list = []
-
-            paxis = np.random.uniform(1e3, 1e5, (num))
-            Ip = np.random.uniform(5e4, 1e6, (num))
-            fvac = np.random.uniform(0.5, 2.0, (num))
-            phy_list = []
-            for p, i, f in zip(paxis, Ip, fvac):
-                phy_list.append(
-                    (p, i, f, 1.8, 1.2, [(1.1, -0.6), (1.1, 0.8)], [(1.1, -0.6, 1.1, 0.6)])
-                )
-            atol, rtol = 1e-6, 1e-4
-            blend = 0.0
-            # constrain = None
-            for idx, (paxis, Ip, fvac, alpha_m, alpha_n, xpoints, isoflux) in enumerate(phy_list):
-                eq = freegs.Equilibrium(
-                    tokamak=freegs.machine.TestTokamak(),
-                    Rmin=Rmin, Rmax=Rmax, Zmin=Zmin, Zmax=Zmax, nx=nR, ny=nZ,
-                    boundary=freegs.boundary.freeBoundaryHagenow
-                )
-                constrain = freegs.control.constrain(
-                    xpoints=xpoints, isoflux=isoflux
-                )
-                if constrain is not None:
-                    constrain(eq)
-                profiles = freegs.jtor.ConstrainPaxisIp(
-                    eq, paxis, Ip, fvac, alpha_m, alpha_n
-                )
-                psi = eq.psi()
-                iteration, limit_iter = 0, 0
-                psi_relchange = 10.0
-                bdry_val = 0.0
-                bdry_val_change = np.inf
-                has_been_limited = False
-                ok_to_break = False
-                check_limited = False
-                psi_maxchange_iterations, psi_relchange_iterations = [], []
-                print(f"Physical state {idx:04d} | " \
-                    f"paxis {paxis:.2e} Ip {Ip:.2e} fvac {fvac:.2e}"
-                    )
-                while True:
-                    self.idx.append(idx)
-                    psi_last = psi.copy()
-                    bdry_val_last = bdry_val
-                    if (iteration >= limit_iter or has_been_limited) and check_limited:
-                        eq.check_limited = True
-                    else:
-                        eq.check_limited = False
-                    eq._profiles = profiles
-                    eq._updateBoundaryPsi()
-                    Jtor = profiles.Jtor(eq.R, eq.Z, psi, psi_bndry=eq.psi_bndry)
-                    if Jtor is None:
-                        break
-                    dR = eq.R[1, 0] - eq.R[0, 0]
-                    dZ = eq.Z[0, 1] - eq.Z[0, 0]
-                    rhs = eq.R * Jtor
-                    rhs[0, :] = 0.0
-                    rhs[:, 0] = 0.0
-                    rhs[-1, :] = 0.0
-                    rhs[:, -1] = 0.0
-                    psi_fixed = eq.callSolver(eq.plasma_psi, rhs)
-                    psi_fixed_tensor = torch.from_numpy(psi_fixed)
-                    self.U.append(psi_fixed_tensor)
-                    coeffs = [(0, 25.0 / 12), (1, -4.0), (2, 3.0), (3, -16.0 / 12), (4, 1.0 / 4)]
-                    dUdn_L = (sum([
-                        weight * psi_fixed[index, :] for index, weight in coeffs
-                        ]) / dR)
-                    dUdn_D = (sum([
-                        weight * psi_fixed[:, index] for index, weight in coeffs
-                        ]) / dZ)
-                    dUdn_R = (sum([
-                        weight * psi_fixed[-(1 + index), :] for index, weight in coeffs
-                        ]) / dR)
-                    dUdn_U = (sum([
-                        weight * psi_fixed[:, -(1 + index)] for index, weight in coeffs
-                        ]) / dZ)
-                    dd = np.sqrt(dR ** 2 + dZ ** 2)
-                    dUdn_L[0] = dUdn_D[0] = (sum([
-                        weight * psi_fixed[index, index] for index, weight in coeffs
-                        ]) / dd)
-                    dUdn_L[-1] = dUdn_U[0] = (sum([
-                        weight * psi_fixed[index, -(1 + index)] for index, weight in coeffs
-                        ]) / dd)
-                    dUdn_R[0] = dUdn_D[-1] = (sum([
-                        weight * psi_fixed[-(1 + index), index] for index, weight in coeffs
-                        ]) / dd)
-                    dUdn_R[-1] = dUdn_U[-1] = (sum([
-                        weight * psi_fixed[-(1 + index), -(1 + index)] for index, weight in coeffs
-                        ]) / dd)
-                    
-                    eps = 1e-2
-                    bndry_indices = np.concatenate([
-                            [(x, 0, 0.0, -eps) for x in range(nR)],
-                            [(x, nZ - 1, 0.0, eps) for x in range(nR)],
-                            [(0, y, -eps, 0.0) for y in range(nZ)],
-                            [(nR - 1, y, eps, 0.0) for y in range(nZ)],
-                        ]) 
-
-                    for x, y, Reps, Zeps in bndry_indices:
-                        x = int(round(x))
-                        y = int(round(y))
-                        Rpos = eq.R[x, y] + Reps
-                        Zpos = eq.Z[x, y] + Zeps
-                        greenfunc = Greens(eq.R[0, :], eq.Z[0, :], Rpos, Zpos)
-                        result = romb(greenfunc * dUdn_L / eq.R[0, :]) * dZ
-                        greenfunc = Greens(eq.R[-1, :], eq.Z[-1, :], Rpos, Zpos)
-                        result += romb(greenfunc * dUdn_R / eq.R[-1, :]) * dZ
-                        greenfunc = Greens(eq.R[:, 0], eq.Z[:, 0], Rpos, Zpos)
-                        result += romb(greenfunc * dUdn_D / eq.R[:, 0]) * dR
-                        greenfunc = Greens(eq.R[:, -1], eq.Z[:, -1], Rpos, Zpos)
-                        result += romb(greenfunc * dUdn_U / eq.R[:, -1]) * dR
-                        eq.plasma_psi[x, y] = result
-                    rhs = -mu0 * eq.R * Jtor
-                    rhs_tensor = rhs.copy()
-                    self.rhs.append(torch.from_numpy(rhs_tensor))
-                    self.bdry.append(torch.from_numpy(np.concatenate([
-                        eq.plasma_psi[0, :], eq.plasma_psi[:, 0],
-                        eq.plasma_psi[-1, :], eq.plasma_psi[:, -1]
-                        ], axis=0)))
-                    rhs[0, :] = eq.plasma_psi[0, :]
-                    rhs[:, 0] = eq.plasma_psi[:, 0]
-                    rhs[-1, :] = eq.plasma_psi[-1, :]
-                    rhs[:, -1] = eq.plasma_psi[:, -1]
-                    plasma_psi = eq._solver(eq.plasma_psi, rhs)
-                    psi_torch = torch.from_numpy(plasma_psi)
-                    self.psi_list.append(psi_torch)
-                    eq._updatePlasmaPsi(plasma_psi)
-                    eq._current = romb(romb(Jtor)) * dR * dZ
-                    eq.Jtor = Jtor
-                    if eq.is_limited:
-                        has_been_limited = True
-                    if eq.psi_bndry is not None:
-                        bdry_val = eq.psi_bndry
-                        bdry_val_change = bdry_val_last - bdry_val
-                        bdry_val_relchange = abs(bdry_val_change / bdry_val)
-                    else:
-                        bdry_val_relchange = 2.0 * rtol
-                    if eq.psi_axis is not None:
-                        self.axis_val_list.append(eq.psi_axis)
-                    else:
-                        self.axis_val_list.append(-1000.0)
-                    
-                    psi = eq.psi()
-                    psi_change = psi_last - psi
-                    psi_maxchange = np.amax(abs(psi_change))
-                    psi_relchange = psi_maxchange / (np.amax(psi) - np.amin(psi))
-                    psi_maxchange_iterations.append(psi_maxchange)
-                    psi_relchange_iterations.append(psi_relchange)
-                    self.bdry_val_list.append(bdry_val)
-                    psi_coil_grid_torch = torch.from_numpy(
-                        eq.tokamak.calcPsiFromGreens(eq._pgreen)
-                        )
-                    self.psi_coil_grid_list.append(psi_coil_grid_torch)
-                    psi_coil_isoflux0 = eq.tokamak.psi(1.1, -0.6)
-                    psi_coil_isoflux1 = eq.tokamak.psi(1.1, 0.6)
-                    psi_coil_x0 = eq.tokamak.psi(1.1, -0.6)
-                    psi_coil_x1 = eq.tokamak.psi(1.1, 0.8)
-                    self.psi_coil_isoflux_list.append(
-                        torch.tensor([psi_coil_isoflux0, psi_coil_isoflux1])
-                        )
-                    self.psi_coil_x = np.array([psi_coil_x0, psi_coil_x1])
-                    self.psi_coil_x_list.append(np.array([psi_coil_x0, psi_coil_x1]))
-                    psi_Br0 = eq.tokamak.Br(*xpoints[0])
-                    psi_Bz0 = eq.tokamak.Bz(*xpoints[0])
-                    psi_Br1 = eq.tokamak.Br(*xpoints[1])
-                    psi_Bz1 = eq.tokamak.Bz(*xpoints[1])
-                    self.psi_coil_Br_list.append(torch.tensor([psi_Br0, psi_Br1]))
-                    self.psi_coil_Bz_list.append(torch.tensor([psi_Bz0, psi_Bz1]))
-                    print(f"iteration: {iteration:02d} | " \
-                        f"psi_relchange: {psi_relchange:.4f} | " \
-                        f"bndry_relchange: {bdry_val_relchange:.4f} | " \
-                        f"bndry_change: {bdry_val_change:.4f}"
-                        )
-                    if (
-                        ((psi_maxchange < atol) and (psi_relchange < rtol))
-                        or (abs(bdry_val_change) < atol and (bdry_val_relchange < rtol))
-                        or iteration >= max_iter
-                    ):
-                        break
-                    iteration += 1
-                    if constrain is not None:
-                        constrain(eq)
-                    psi = (1.0 - blend) * eq.psi() + blend * psi_last
-                
-            if save_path is not None:
-                save_path = os.path.join('data', save_path)
-                os.makedirs(save_path, exist_ok=True)
-                torch.save(self.idx, os.path.join(save_path, 'index.pt'))
-                torch.save(self.rhs, os.path.join(save_path, 'rhs.pt'))
-                torch.save(self.bdry, os.path.join(save_path, 'bdry.pt'))
-                torch.save(self.psi_list, os.path.join(save_path, 'psi.pt'))
-                torch.save(self.psi_coil_isoflux_list, os.path.join(save_path, 'isoflux.pt'))
-                torch.save(self.psi_coil_Br_list, os.path.join(save_path, 'Br.pt'))
-                torch.save(self.psi_coil_Bz_list, os.path.join(save_path, 'Bz.pt'))
-                torch.save(self.psi_coil_grid_list, os.path.join(save_path, 'coil_grid.pt'))
-                torch.save(self.U, os.path.join(save_path, 'U.pt'))
-
-    def __len__(self):
-        return len(self.rhs)
-    
-    def __getitem__(self, index: int) -> Tuple[Tensor]:
-        return self.rhs[index], self.bdry[index], self.psi_list[index], \
-            self.psi_coil_isoflux_list[index], self.psi_coil_Br_list[index], \
-            self.psi_coil_Bz_list[index], self.psi_coil_grid_list[index], \
-            self.U[index]
 
 class GSrhsdatasetMASTU_f(Dataset):
 
@@ -337,6 +70,49 @@ class GSrhsdatasetMASTU_f(Dataset):
         self.rhs_f = torch.load(os.path.join(load_path, 'rhs_f.pt'), weights_only=True)
         self.bdry_f = torch.load(os.path.join(load_path, 'bdry_f.pt'), weights_only=True)
         self.psi_list_f = torch.load(os.path.join(load_path, 'psi_f.pt'), weights_only=True)
+        for name in [
+            'constraint_f',
+            'tokamak_psi_f',
+            'psi_axis_f',
+            'psi_bndry_f',
+            'flag_limiter_f',
+            'diverted_psi_bndry_f',
+            'psi_on_limiter_f',
+            'limiter_margin_f',
+            'mask_size_f',
+        ]:
+            path = os.path.join(load_path, f'{name}.pt')
+            if os.path.exists(path):
+                setattr(self, name, torch.load(path, weights_only=True))
+        row_ok = (
+            torch.isfinite(self.rhs_f.flatten(1)).all(dim=1) &
+            torch.isfinite(self.bdry_f.flatten(1)).all(dim=1) &
+            torch.isfinite(self.psi_list_f.flatten(1)).all(dim=1)
+        )
+        if not bool(row_ok.all()):
+            print(
+                f"Dropping {int((~row_ok).sum())} non-finite F samples "
+                f"from {load_path}."
+            )
+            n_f = len(row_ok)
+            self.idx_f = self.idx_f[row_ok]
+            self.rhs_f = self.rhs_f[row_ok]
+            self.bdry_f = self.bdry_f[row_ok]
+            self.psi_list_f = self.psi_list_f[row_ok]
+            for name in [
+                'constraint_f',
+                'tokamak_psi_f',
+                'psi_axis_f',
+                'psi_bndry_f',
+                'flag_limiter_f',
+                'diverted_psi_bndry_f',
+                'psi_on_limiter_f',
+                'limiter_margin_f',
+                'mask_size_f',
+            ]:
+                value = getattr(self, name, None)
+                if torch.is_tensor(value) and value.ndim > 0 and len(value) == n_f:
+                    setattr(self, name, value[row_ok])
         self.idx_g = torch.load(os.path.join(load_path, 'index_g.pt'), weights_only=True)
         self.psi_g = torch.load(os.path.join(load_path, 'psi_g.pt'), weights_only=True)
         self.update_g = torch.load(os.path.join(load_path, 'update_g.pt'), weights_only=True)
@@ -370,6 +146,15 @@ class GSrhsdatasetMASTU_f(Dataset):
         self.rhs_f = []
         self.bdry_f = []
         self.res0_f = []
+        self.constraint_f = []
+        self.tokamak_psi_f = []
+        self.psi_axis_f = []
+        self.psi_bndry_f = []
+        self.flag_limiter_f = []
+        self.diverted_psi_bndry_f = []
+        self.psi_on_limiter_f = []
+        self.limiter_margin_f = []
+        self.mask_size_f = []
         self.idx_g = []
         self.update_g = []
         self.psi_list_g = []
@@ -405,20 +190,33 @@ class GSrhsdatasetMASTU_f(Dataset):
         with open('freegsnke/examples/data/simple_limited_currents_PaxisIp.pk', 'rb') as f:
             currents_dict_limited = pickle.load(f)
 
-        paxis = [8e3]
-        Ip = [6e5]
-        fvac = [0.5]
-        # paxis = np.random.uniform(1e3, 5e4, (num))
-        # Ip = np.random.uniform(5e4, 1e6, (num))
-        # fvac = np.random.uniform(0.5, 1.5, (num))
-        # limited_or_diverted = np.random.choice([0, 1], size=(num))
+        # paxis = [8e3]
+        # Ip = [6e5]
+        # fvac = [0.5]
+        beta0 = 8e3 / 6e5 ** 2
+        diverted_num = int(0.5 * num)
+        transition_num = int(0.2 * num)
+        limited_num = num - diverted_num - transition_num
+        Ip = np.concatenate([
+            np.random.uniform(3.5e5, 6.5e5, (diverted_num)),
+            np.random.uniform(3.5e5, 6.0e5, (transition_num)),
+            np.random.uniform(3.5e5, 5.5e5, (limited_num))
+        ])
+        beta_mult = np.concatenate([
+            np.random.uniform(0.8, 1.4, (diverted_num)),
+            np.random.uniform(1.4, 2.0, (transition_num)),
+            np.random.uniform(2.0, 2.4, (limited_num))
+        ])
+        paxis = beta_mult * beta0 * Ip ** 2
+        fvac = np.ones((num)) * 0.5
+
         phy_list = []
         for p, i, f in zip(paxis, Ip, fvac):
             phy_list.append(
                 (p, i, f, alpha_m, alpha_n)
             )
 
-        target_relative_tolerance = 1e-6
+        target_relative_tolerance = 1e-9
         max_solving_iterations = max_iter
         Picard_handover = 0.1
         max_rel_update_size = 0.15
@@ -457,9 +255,83 @@ class GSrhsdatasetMASTU_f(Dataset):
                 ).reshape(-1)
             control_trial_psi = False
             n_up = 0.0 + 4 * eq.solved
+
+            def F_function(plasma_psi, tokamak_psi, profiles):
+                solver.jtor = profiles.Jtor(
+                    _R_cpu, _Z_cpu, (
+                        solver.tokamak_psi + plasma_psi
+                        ).reshape(self.nx, self.ny)
+                )
+                solver.rhs = solver.rhs_before_jtor * solver.jtor 
+                
+                solver.psi_boundary = np.zeros_like(_R_cpu)
+                psi_bnd = np.tensordot(
+                    solver.greenfunc, solver.jtor, 
+                    axes=([1, 2], [0, 1])
+                    )
+                solver.psi_boundary[:, 0] = psi_bnd[:self.nx]
+                solver.psi_boundary[:, -1] = psi_bnd[self.nx:2*self.nx]
+                solver.psi_boundary[0, 1:self.ny-1] = psi_bnd[
+                    2 * self.nx:2 * self.nx + (self.ny - 2)
+                ]
+                solver.psi_boundary[-1, 1:self.ny-1] = psi_bnd[
+                    2 * self.nx + self.ny - 2:
+                ]
+                solver.rhs[0, :] = solver.psi_boundary[0, :]
+                solver.rhs[:, 0] = solver.psi_boundary[:, 0]
+                solver.rhs[-1, :] = solver.psi_boundary[-1, :]
+                solver.rhs[:, -1] = solver.psi_boundary[:, -1]
+                psi_list_f = solver.linear_GS_solver(
+                    solver.psi_boundary, solver.rhs
+                ).reshape(-1)
+
+                if (
+                    (not np.isfinite(solver.rhs).all()) or
+                    (not np.isfinite(psi_bnd).all()) or
+                    (not np.isfinite(psi_list_f).all())
+                ):
+                    raise FloatingPointError("Non-finite F sample generated.")
+                assert np.isclose(
+                    solver.F_function(plasma_psi, tokamak_psi, profiles),
+                    plasma_psi - psi_list_f, atol=1e-6, rtol=1e-4
+                ).all()
+
+                diverted_psi_bndry = getattr(
+                    profiles, 'diverted_psi_bndry', np.nan
+                )
+                interpolated = getattr(
+                    profiles.limiter_handler, 'interpolated_on_limiter', []
+                )
+                if len(interpolated):
+                    psi_on_limiter = float(np.amax(np.asarray(interpolated)))
+                else:
+                    psi_on_limiter = np.nan
+                if np.isfinite(psi_on_limiter) and np.isfinite(diverted_psi_bndry):
+                    limiter_margin = psi_on_limiter - diverted_psi_bndry
+                else:
+                    limiter_margin = np.nan
+
+                self.idx_f.append(idx)
+                self.rhs_f.append(solver.rhs)
+                self.bdry_f.append(psi_bnd)
+                self.psi_list_f.append(psi_list_f)
+                self.constraint_f.append(constraint)
+                self.tokamak_psi_f.append(solver.tokamak_psi)
+                self.psi_axis_f.append(profiles.inputs[0])
+                self.psi_bndry_f.append(profiles.psi_bndry)
+                self.flag_limiter_f.append(profiles.flag_limiter)
+                self.diverted_psi_bndry_f.append(diverted_psi_bndry)
+                self.psi_on_limiter_f.append(psi_on_limiter)
+                self.limiter_margin_f.append(limiter_margin)
+                self.mask_size_f.append(
+                    int(np.sum(np.asarray(profiles.limiter_core_mask).astype(bool)))
+                )
+
+                return plasma_psi - psi_list_f
+
             while (control_trial_psi is False) and (n_up < 10):
                 try:
-                    res0 = solver.F_function(
+                    res0 = F_function(
                         trial_plasma_psi, solver.tokamak_psi, profiles
                         )
                     print(f'{idx} | Residual found')
@@ -516,7 +388,7 @@ class GSrhsdatasetMASTU_f(Dataset):
                         x0=trial_plasma_psi.copy(),
                         dx=starting_direction.copy(),
                         R0=res0.copy(),
-                        F_function=solver.F_function,
+                        F_function=F_function,
                         args=args,
                         step_size=2.5,
                         scaling_with_n=-1.0,
@@ -534,67 +406,16 @@ class GSrhsdatasetMASTU_f(Dataset):
                 while new_residual_flag:
                     try:
                         n_trial_plasma_psi = trial_plasma_psi + update
-                        solver.jtor = profiles.Jtor(
-                            _R_cpu, _Z_cpu, (
-                                solver.tokamak_psi + n_trial_plasma_psi
-                                ).reshape(self.nx, self.ny)
-                        )
-                        solver.rhs = solver.rhs_before_jtor * solver.jtor 
                         
-                        solver.psi_boundary = np.zeros_like(_R_cpu)
-                        psi_bnd = np.tensordot(
-                            solver.greenfunc, solver.jtor, 
-                            axes=([1, 2], [0, 1])
-                            )
-                        solver.psi_boundary[:, 0] = psi_bnd[:self.nx]
-                        solver.psi_boundary[:, -1] = psi_bnd[self.nx:2*self.nx]
-                        solver.psi_boundary[0, 1:self.ny-1] = psi_bnd[
-                            2 * self.nx:2 * self.nx + (self.ny - 2)
-                        ]
-                        solver.psi_boundary[-1, 1:self.ny-1] = psi_bnd[
-                            2 * self.nx + self.ny - 2:
-                        ]
-                        if ~np.any(np.isnan(solver.psi_boundary)):
-                            self.idx_f.append(idx)
-                            # self.psi_list_f.append(n_trial_plasma_psi)
-                            self.rhs_f.append(solver.rhs)
-                            self.bdry_f.append(psi_bnd)
-                            self.psi_list_h.append(n_trial_plasma_psi)
-                            self.tokamak_psi_h.append(solver.tokamak_psi)
-                            self.psi_axis_h.append(profiles.inputs[0])
-                            self.psi_bndry_h.append(profiles.psi_bndry)
-                            self.flag_limiter_h.append(profiles.flag_limiter) 
-                            if picard_flag == False:
-                                self.idx_g.append(idx)
-                                self.psi_list_g.append(trial_plasma_psi)
-                                self.tokamak_psi_g.append(solver.tokamak_psi)
-                                self.R0_g.append(solver.nksolver.R0)
-                                self.constraint_g.append(constraint)
-                                self.update_g.append(solver.nksolver.dx)
-                                self.G_list_g.append(solver.nksolver.G)
-                                self.Q_list_g.append(solver.nksolver.Qn)
+                        new_res0 = F_function(n_trial_plasma_psi, solver.tokamak_psi, profiles)
+                        new_norm_rel_change = solver.relative_norm_residual(
+                            new_res0, n_trial_plasma_psi
+                        )
+                        new_rel_change, new_del_psi = solver.relative_del_residual(
+                            new_res0, n_trial_plasma_psi
+                        )
+                        new_residual_flag = False
 
-                            solver.rhs[0, :] = solver.psi_boundary[0, :]
-                            solver.rhs[:, 0] = solver.psi_boundary[:, 0]
-                            solver.rhs[-1, :] = solver.psi_boundary[-1, :]
-                            solver.rhs[:, -1] = solver.psi_boundary[:, -1]
-                            
-                            new_res0 = n_trial_plasma_psi - \
-                                solver.linear_GS_solver(
-                                    solver.psi_boundary, solver.rhs
-                                    ).reshape(-1)
-                            self.res0_f.append(new_res0)
-                            if ~np.any(np.isnan(solver.psi_boundary)):
-                                self.psi_list_f.append(solver.linear_GS_solver(
-                                        solver.psi_boundary, solver.rhs
-                                    ).reshape(-1))
-                            new_norm_rel_change = solver.relative_norm_residual(
-                                new_res0, n_trial_plasma_psi
-                            )
-                            new_rel_change, new_del_psi = solver.relative_del_residual(
-                                new_res0, n_trial_plasma_psi
-                            )
-                            new_residual_flag = False
                     except:
                         update *= 0.75
                         num_update_reduce += 1
@@ -621,7 +442,7 @@ class GSrhsdatasetMASTU_f(Dataset):
                                     * 1.5 * np.random.random()
                                 )[np.newaxis, :]
                             starting_direction = starting_direction.reshape(-1)
-                            strating_direction *= trial_plasma_psi
+                            starting_direction *= trial_plasma_psi
                         else:
                             starting_direction = np.copy(res0)
                     except:
@@ -663,6 +484,10 @@ class GSrhsdatasetMASTU_f(Dataset):
                 solver.relative_change = 1.0 * rel_change
                 solver.norm_rel_change.append(norm_rel_change)
                 print(f"{idx} | relative error {rel_change:.4e} ")
+                if rel_change < target_relative_tolerance:
+                    print(
+                        f"{idx} | Converged in {int(iterations)} iterations.")
+                    break
                 iterations += 1
 
             if solver.best_relative_change < rel_change:
@@ -699,11 +524,22 @@ class GSrhsdatasetMASTU_f(Dataset):
     def save_data(self, save_path: str) -> None:
         save_path = os.path.join('data', save_path)
         os.makedirs(save_path, exist_ok=True)
-        idx_f = torch.from_numpy(np.array(self.idx_f[:-1]))
-        rhs_f = torch.from_numpy(np.array(self.rhs_f[:-1]))
-        bdry_f = torch.from_numpy(np.array(self.bdry_f[:-1]))
-        res0_f = torch.from_numpy(np.array(self.res0_f[:-1]))
-        psi_list_f = torch.from_numpy(np.array(self.psi_list_f[1:]))
+        idx_f = torch.from_numpy(np.array(self.idx_f))
+        rhs_f = torch.from_numpy(np.array(self.rhs_f))
+        bdry_f = torch.from_numpy(np.array(self.bdry_f))
+        res0_f = torch.from_numpy(np.array(self.res0_f))
+        psi_list_f = torch.from_numpy(np.array(self.psi_list_f))
+        constraint_f = torch.from_numpy(np.array(self.constraint_f))
+        tokamak_psi_f = torch.from_numpy(np.array(self.tokamak_psi_f))
+        psi_axis_f = torch.from_numpy(np.array(self.psi_axis_f))
+        psi_bndry_f = torch.from_numpy(np.array(self.psi_bndry_f))
+        flag_limiter_f = torch.from_numpy(np.array(self.flag_limiter_f))
+        diverted_psi_bndry_f = torch.from_numpy(
+            np.array(self.diverted_psi_bndry_f)
+        )
+        psi_on_limiter_f = torch.from_numpy(np.array(self.psi_on_limiter_f))
+        limiter_margin_f = torch.from_numpy(np.array(self.limiter_margin_f))
+        mask_size_f = torch.from_numpy(np.array(self.mask_size_f))
         idx_g = torch.from_numpy(np.array(self.idx_g))
         psi_g = torch.from_numpy(np.array(self.psi_list_g))
         update_g = torch.from_numpy(np.array(self.update_g))
@@ -721,6 +557,22 @@ class GSrhsdatasetMASTU_f(Dataset):
         torch.save(rhs_f, os.path.join(save_path, 'rhs_f.pt'))
         torch.save(bdry_f, os.path.join(save_path, 'bdry_f.pt'))
         torch.save(psi_list_f, os.path.join(save_path, 'psi_f.pt'))
+        torch.save(constraint_f, os.path.join(save_path, 'constraint_f.pt'))
+        torch.save(tokamak_psi_f, os.path.join(save_path, 'tokamak_psi_f.pt'))
+        torch.save(psi_axis_f, os.path.join(save_path, 'psi_axis_f.pt'))
+        torch.save(psi_bndry_f, os.path.join(save_path, 'psi_bndry_f.pt'))
+        torch.save(flag_limiter_f, os.path.join(save_path, 'flag_limiter_f.pt'))
+        torch.save(
+            diverted_psi_bndry_f,
+            os.path.join(save_path, 'diverted_psi_bndry_f.pt')
+        )
+        torch.save(
+            psi_on_limiter_f, os.path.join(save_path, 'psi_on_limiter_f.pt')
+        )
+        torch.save(
+            limiter_margin_f, os.path.join(save_path, 'limiter_margin_f.pt')
+        )
+        torch.save(mask_size_f, os.path.join(save_path, 'mask_size_f.pt'))
         torch.save(idx_g, os.path.join(save_path, 'index_g.pt'))
         torch.save(psi_g, os.path.join(save_path, 'psi_g.pt'))
         torch.save(update_g, os.path.join(save_path, 'update_g.pt'))

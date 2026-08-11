@@ -1,1 +1,1 @@
-from .dataset import GSrhsdataset, GSrhsdatasetMASTU_f, GSrhsdatasetMASTU_g, GSrhsdatasetMASTU_separatrix
+from .dataset import GSrhsdatasetMASTU_f, GSrhsdatasetMASTU_g, GSrhsdatasetMASTU_separatrix
