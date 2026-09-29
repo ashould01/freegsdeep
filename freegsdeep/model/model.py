@@ -379,7 +379,7 @@ class PINTO_jax(eqx.Module):
             eqx.nn.Linear(64, 30, key=key32, dtype=dtype)
         ))
         self.value_encoder = eqx.filter_vmap(value_encoder)
-        self.MHA1 = eqx.nn.MultiheadAttention(num_heads=2, query_size=30, key=key4)
+        self.MHA1 = eqx.nn.MultiheadAttention(num_heads=2, query_size=30, dtype=dtype, key=key4)
         key51, key52 = jax.random.split(key5, 2)
         mlp2 = eqx.nn.Sequential((
             eqx.nn.Linear(30, 64, key=key51, dtype=dtype),
@@ -387,7 +387,7 @@ class PINTO_jax(eqx.Module):
             eqx.nn.Linear(64, 30, key=key52, dtype=dtype)
         ))
         self.mlp2 = eqx.filter_vmap(mlp2)
-        self.MHA3 = eqx.nn.MultiheadAttention(num_heads=2, query_size=30, key=key6)
+        self.MHA3 = eqx.nn.MultiheadAttention(num_heads=2, query_size=30, dtype=dtype, key=key6)
         key71, key72 = jax.random.split(key7, 2)
         mlp4 = eqx.nn.Sequential((
             eqx.nn.Linear(30, 64, key=key71, dtype=dtype),
@@ -455,22 +455,21 @@ class Integratednet_jax(eqx.Module):
         y = (Z - self.Zmin) / (self.Zmax - self.Zmin)
         return x, y
     
-    def lifting(self, x: JaxArray, y: JaxArray, rhs: JaxArray) -> JaxArray:
+    def lifting(self, x: JaxArray, y: JaxArray, branch: JaxArray) -> JaxArray:
         zero = jnp.zeros(1, dtype=self.dtype)
         one = jnp.ones(1, dtype=self.dtype)
-        branch = self.resi_net.branch(rhs)
-        lb = self.resi_net.output_mlp(self.resi_net.trunk(x, zero), branch) + \
-            self.resi_net.output_mlp(self.resi_net.trunk(zero, y), branch) - \
-            self.resi_net.output_mlp(self.resi_net.trunk(zero, zero), branch)
-        rb = self.resi_net.output_mlp(self.resi_net.trunk(x, zero), branch) + \
-            self.resi_net.output_mlp(self.resi_net.trunk(one, y), branch) - \
-            self.resi_net.output_mlp(self.resi_net.trunk(one, zero), branch)
-        rt = self.resi_net.output_mlp(self.resi_net.trunk(one, y), branch) + \
-            self.resi_net.output_mlp(self.resi_net.trunk(x, one), branch) - \
-            self.resi_net.output_mlp(self.resi_net.trunk(one, one), branch)
-        lt = self.resi_net.output_mlp(self.resi_net.trunk(zero, y), branch) + \
-            self.resi_net.output_mlp(self.resi_net.trunk(x, one), branch) - \
-            self.resi_net.output_mlp(self.resi_net.trunk(zero, one), branch)
+        f_x_0 = self.resi_net.output_mlp(self.resi_net.trunk(x, zero), branch)
+        f_0_y = self.resi_net.output_mlp(self.resi_net.trunk(zero, y), branch)
+        f_x_1 = self.resi_net.output_mlp(self.resi_net.trunk(x, one), branch)
+        f_1_y = self.resi_net.output_mlp(self.resi_net.trunk(one, y), branch)
+        f_0_0 = self.resi_net.output_mlp(self.resi_net.trunk(zero, zero), branch)
+        f_1_0 = self.resi_net.output_mlp(self.resi_net.trunk(one, zero), branch)
+        f_1_1 = self.resi_net.output_mlp(self.resi_net.trunk(one, one), branch)
+        f_0_1 = self.resi_net.output_mlp(self.resi_net.trunk(zero, one), branch)
+        lb = f_x_0 + f_0_y - f_0_0
+        rb = f_x_0 + f_1_y - f_1_0
+        rt = f_x_1 + f_1_y - f_1_1
+        lt = f_0_y + f_x_1 - f_0_1
         return (1 - x) * (1 - y) * lb + x * (1 - y) * rb + \
             x * y * rt + (1 - x) * y * lt
         
@@ -483,8 +482,9 @@ class Integratednet_jax(eqx.Module):
         scaling_bdry = bdry_value.max() - bdry_value.min() if bdry_value.size > 0 else 1.0
         bdry_value = bdry_value / scaling_bdry
         x, y = self.transformation(R, Z)
-        resi_output = self.resi_net(x, y, rhs)
-        resi_output_lift = self.lifting(x, y, rhs)
+        branch = self.resi_net.branch(rhs)
+        resi_output = self.resi_net.output_mlp(self.resi_net.trunk(x, y), branch)
+        resi_output_lift = self.lifting(x, y, branch)
         bdry_output = self.bdry_net(R, Z, bdry_point, bdry_value).reshape(1)
         return scaling_rhs * (resi_output - resi_output_lift) + scaling_bdry * bdry_output
 

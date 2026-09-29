@@ -48,6 +48,7 @@ class Jtor_build_result:
     diverted_core_mask: jax.Array
     limiter_core_mask: jax.Array
     flag_limiter: jax.Array
+    flood_fill_steps: jax.Array
 
     def __iter__(self):
         yield self.jtor
@@ -114,6 +115,7 @@ def Jtor_part1(
     *,
     psi_bndry: float | jax.Array | None = None,
     max_iterations: int | None = None,
+    los_top_k: int = 20,
 ) -> Jtor_part1_result:
     """Run the JAX version of ``freegs4e.jtor.Profile.Jtor_part1``.
 
@@ -123,6 +125,8 @@ def Jtor_part1(
     a rectangular grid.
     """
 
+    if los_top_k < 1:
+        raise ValueError("los_top_k must be at least one.")
     iteration_count = psi.shape[0] + psi.shape[1] - 2 \
         if max_iterations is None else max_iterations
     provided_boundary = psi_bndry is not None
@@ -136,11 +140,14 @@ def Jtor_part1(
         boundary_value, 
         provided_boundary,
         int(iteration_count),
+        los_top_k,
     )
-    return Jtor_part1_result(*outputs)
+    # ``flood_fill_steps`` is an internal diagnostic appended by the kernel;
+    # retain the established public Jtor_part1 result shape.
+    return Jtor_part1_result(*outputs[:6])
 
 
-@partial(jax.jit, static_argnames=("max_iterations",))
+@partial(jax.jit, static_argnames=("max_iterations", "los_top_k"))
 def _jtor_part1_kernel(
     R: jax.Array,
     Z: jax.Array,
@@ -150,15 +157,15 @@ def _jtor_part1_kernel(
     supplied_psi_bndry: jax.Array,
     use_supplied_psi_bndry: jax.Array,
     max_iterations: int,
+    los_top_k: int = 20,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
 
     opt, has_opt, xpt, has_xpt, xpt_cells = _critical_points(
-        R, Z, psi, mask_inside_limiter, ip
+        R, Z, psi, mask_inside_limiter, ip, los_top_k
     )
     one = jnp.ones((), dtype=psi.dtype)
     sign_direction = jnp.where(ip < 0, -one, one)
     oriented_psi = psi * sign_direction
-    neg_inf = jnp.asarray(-jnp.inf, dtype=psi.dtype)
     psi_bndry_oriented = jnp.where(
         use_supplied_psi_bndry,
         supplied_psi_bndry * sign_direction,
@@ -166,28 +173,37 @@ def _jtor_part1_kernel(
     )
     axis_r_index = jnp.argmin(jnp.abs(R[:, 0] - opt[0]))
     axis_z_index = jnp.argmin(jnp.abs(Z[0, :] - opt[1]))
-    axis_psi = oriented_psi[axis_r_index, axis_z_index]
-    score = jnp.full_like(oriented_psi, neg_inf).at[
-        axis_r_index, axis_z_index
-    ].set(axis_psi)
     blocked = _dilate_cells(xpt_cells)
+    # ``score > psi_bndry`` in the former maximin propagation is equivalent
+    # to reachability from the axis through cells strictly above the
+    # separatrix.  Carrying only this boolean reachability map avoids a
+    # float64 min/max map on every flood-fill sweep.
+    allowed = (
+        (oriented_psi > psi_bndry_oriented)
+        & ~blocked
+    )
+    reachable = jnp.zeros_like(allowed).at[axis_r_index, axis_z_index].set(
+        allowed[axis_r_index, axis_z_index]
+    )
 
     def cond_fn(state):
         _, changed, step = state
         return changed & (step < max_iterations)
 
     def body_fn(state):
-        score, _, step = state
-        next_score = _propagate_score(score, oriented_psi, blocked)
-        changed = jnp.any(next_score != score)
-        return next_score, changed, step + 1
+        reachable, _, step = state
+        next_reachable = _propagate_reachable(reachable, allowed)
+        changed = jnp.any(next_reachable != reachable)
+        return next_reachable, changed, step + 1
 
-    score, _, _ = jax.lax.while_loop(
+    reachable, _, flood_fill_steps = jax.lax.while_loop(
         cond_fn,
         body_fn,
-        (score, jnp.array(True), jnp.array(0)),
+        (reachable, jnp.array(True), jnp.array(0)),
     )
-    core_mask = (score > psi_bndry_oriented) & mask_inside_limiter
+    # Preserve the established JAX behaviour: limiter membership is applied
+    # to the final core, while flood-fill may traverse the surrounding grid.
+    core_mask = reachable & mask_inside_limiter
     core_mask = core_mask & _geometric_core_side(R, Z, opt, xpt, has_xpt)
     has_core = jnp.any(core_mask)
     has_boundary = has_opt & has_core & (use_supplied_psi_bndry | has_xpt)
@@ -202,6 +218,7 @@ def _jtor_part1_kernel(
         psi_bndry,
         has_xpt,
         has_boundary,
+        flood_fill_steps,
     )
 
 
@@ -211,6 +228,7 @@ def _critical_points(
     psi: jax.Array,
     mask_inside_limiter: jax.Array,
     ip: jax.Array,
+    los_top_k: int = 20,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """JAX translation of ``scan_for_crit`` + ``find_critical`` selection."""
 
@@ -268,14 +286,39 @@ def _critical_points(
     # saddle is the primary X-point returned to the caller.
     xpoint_cells = valid & (determinant < 0)
     xpoint_cells = xpoint_cells & ((estimated_psi - opt[2]) * ip < 0)
-    x_candidates = xpoint_cells & _monotonic_line_of_sight(
-        R, Z, psi, opt, candidate_r, candidate_z, estimated_psi
-    )
     x_cost = (estimated_psi - opt[2]) ** 2
-    x_index = jnp.argmin(jnp.where(x_candidates, x_cost, jnp.inf))
-    has_xpt = has_opt & jnp.any(x_candidates)
-    x_r, x_z = x_index // width, x_index % width
-    xpt = jnp.stack([candidate_r[x_r, x_z], candidate_z[x_r, x_z], estimated_psi[x_r, x_z]])
+    # Numerical ``find_critical`` sorts the valid X-points by x_cost and
+    # checks their lines of sight in that order.  JAX cannot create a
+    # variable-length candidate list inside JIT, so retain only a fixed number
+    # of the best valid saddles.  On MAST-U this is much smaller than the full
+    # 61 x 125 candidate grid, while ``los_top_k`` remains user-configurable.
+    k = min(los_top_k, xpoint_cells.size)
+    flat_cost = x_cost.reshape(-1)
+    flat_xpoint_cells = xpoint_cells.reshape(-1)
+    top_scores, top_indices = jax.lax.top_k(
+        jnp.where(flat_xpoint_cells, -flat_cost, -jnp.inf), k
+    )
+    top_valid = jnp.isfinite(top_scores)
+    top_candidate_r = candidate_r.reshape(-1)[top_indices]
+    top_candidate_z = candidate_z.reshape(-1)[top_indices]
+    top_candidate_psi = estimated_psi.reshape(-1)[top_indices]
+    top_cost = flat_cost[top_indices]
+    top_los = top_valid & _monotonic_line_of_sight(
+        R,
+        Z,
+        psi,
+        opt,
+        top_candidate_r,
+        top_candidate_z,
+        top_candidate_psi,
+    )
+    x_index = jnp.argmin(jnp.where(top_los, top_cost, jnp.inf))
+    has_xpt = has_opt & jnp.any(top_los)
+    xpt = jnp.stack([
+        top_candidate_r[x_index],
+        top_candidate_z[x_index],
+        top_candidate_psi[x_index],
+    ])
     # Keep the full X-point set for the flood-fill barrier.  ``xpt`` above is
     # still the primary X-point selected by the original API, but
     # ``critical.inside_mask_`` protects the neighbourhood of every X-point
@@ -358,19 +401,19 @@ def _geometric_core_side(
     return jnp.where(has_xpt, mask, jnp.ones_like(mask, dtype=bool))
 
 
-def _propagate_score(
-    score: jax.Array, oriented_psi: jax.Array, blocked: jax.Array
+def _propagate_reachable(
+    reachable: jax.Array, allowed: jax.Array
 ) -> jax.Array:
-    """One four-neighbour maximin flood-fill step, suitable for ``lax``."""
+    """One four-neighbour boolean flood-fill step, suitable for ``lax``."""
 
-    neg_inf = jnp.asarray(-jnp.inf, dtype=score.dtype)
-    padded_score = jnp.pad(score, ((1, 1), (1, 1)), constant_values=neg_inf)
-    neighbour_score = jnp.maximum(
-        jnp.maximum(padded_score[:-2, 1:-1], padded_score[2:, 1:-1]),
-        jnp.maximum(padded_score[1:-1, :-2], padded_score[1:-1, 2:]),
+    padded_reachable = jnp.pad(reachable, ((1, 1), (1, 1)), constant_values=False)
+    neighbour_reachable = (
+        padded_reachable[:-2, 1:-1]
+        | padded_reachable[2:, 1:-1]
+        | padded_reachable[1:-1, :-2]
+        | padded_reachable[1:-1, 2:]
     )
-    candidate = jnp.where(blocked, neg_inf, jnp.minimum(oriented_psi, neighbour_score))
-    return jnp.maximum(score, candidate)
+    return reachable | (allowed & neighbour_reachable)
 
 
 @jax.jit
@@ -396,7 +439,7 @@ def _core_mask_limiter_kernel(psi, psi_bndry, core_mask, limiter_cells, cell_ids
     return boundary, corrected, flag, offending, values, active
 
 
-@partial(jax.jit, static_argnames=("max_iterations",))
+@partial(jax.jit, static_argnames=("max_iterations", "los_top_k"))
 def _jtor_build_kernel(
     R: jax.Array,
     Z: jax.Array,
@@ -416,6 +459,7 @@ def _jtor_build_kernel(
     alpha_m: jax.Array,
     alpha_n: jax.Array,
     max_iterations: int,
+    los_top_k: int = 20,
 ) -> tuple[jax.Array, ...]:
     """Build the current profile without any data-dependent Python control flow.
 
@@ -431,6 +475,7 @@ def _jtor_build_kernel(
         diverted_psi_bndry,
         _,
         _,
+        flood_fill_steps,
     ) = _jtor_part1_kernel(
         R,
         Z,
@@ -440,6 +485,7 @@ def _jtor_build_kernel(
         supplied_psi_bndry,
         use_supplied_psi_bndry,
         max_iterations,
+        los_top_k,
     )
 
     def no_diverted_core(_):
@@ -504,6 +550,77 @@ def _jtor_build_kernel(
         diverted_core_mask,
         limiter_core_mask,
         flag_limiter,
+        flood_fill_steps,
+    )
+
+
+@partial(jax.jit, static_argnames=("max_iterations",))
+def _jtor_build_from_core_mask_kernel(
+    R: jax.Array,
+    Z: jax.Array,
+    psi: jax.Array,
+    core_mask: jax.Array,
+    limiter_cells: jax.Array,
+    cell_ids: jax.Array,
+    weights_r: jax.Array,
+    weights_z: jax.Array,
+    d_r_d_z: jax.Array,
+    paxis: jax.Array,
+    Ip: jax.Array,
+    Raxis: jax.Array,
+    alpha_m: jax.Array,
+    alpha_n: jax.Array,
+    psi_axis: jax.Array,
+    psi_bndry: jax.Array,
+    max_iterations: int,
+) -> tuple[jax.Array, ...]:
+    """Build a current profile from an externally supplied core mask."""
+    def no_core(_):
+        return psi_bndry, jnp.zeros_like(core_mask), jnp.array(False)
+
+    def apply_limiter(_):
+        boundary, corrected, flag, _, _, _ = _core_mask_limiter_kernel(
+            psi,
+            psi_bndry,
+            core_mask,
+            limiter_cells,
+            cell_ids,
+            weights_r,
+            weights_z,
+            d_r_d_z,
+        )
+        return boundary, corrected, flag
+
+    boundary, limiter_core_mask, flag_limiter = jax.lax.cond(
+        jnp.any(core_mask), apply_limiter, no_core, operand=None
+    )
+    jtor, jtorshape = _ConstrainPaxisIp_kernel(
+        R,
+        Z,
+        psi,
+        psi_axis,
+        boundary,
+        limiter_core_mask,
+        paxis,
+        Ip,
+        Raxis,
+        alpha_m,
+        alpha_n,
+    )
+    nan_point = jnp.full((1, 3), jnp.nan, dtype=psi.dtype)
+    opt = jnp.concatenate(
+        (jnp.zeros((1, 2), dtype=psi.dtype), psi_axis.reshape(1, 1)), axis=1
+    )
+    return (
+        jtor,
+        jtorshape,
+        opt,
+        nan_point,
+        boundary,
+        core_mask,
+        limiter_core_mask,
+        flag_limiter,
+        jnp.array(0, dtype=jnp.int32),
     )
 
 class Limiter_handler:
@@ -711,7 +828,8 @@ class ConstrainPaxisIp:
         fvac: float,
         alpha_m: float,
         alpha_n: float,
-        Raxis: float = 1.0
+        Raxis: float = 1.0,
+        los_top_k: int = 20,
     ):
 
         self.paxis = paxis
@@ -726,6 +844,9 @@ class ConstrainPaxisIp:
         if Raxis < 0:
             raise ValueError("Raxis must be positive.")
         self.Raxis = Raxis
+        if los_top_k < 1:
+            raise ValueError("los_top_k must be at least one.")
+        self.los_top_k = los_top_k
         self.limiter_handler = Limiter_handler(eq, eq.tokamak.limiter)
     
     def Jtor(
@@ -734,11 +855,15 @@ class ConstrainPaxisIp:
         Z: jax.Array,
         psi: jax.Array,
         psi_bndry: float = None,
+        core_mask: jax.Array | None = None,
+        psi_axis: jax.Array | None = None,
     ):
+        result = self.Jtor_build(
+            R, Z, psi, psi_bndry, self.limiter_handler, self.Ip, core_mask, psi_axis
+        )
         self.jtor, self.opt, self.xpt, self.psi_bndry, self.diverted_core_mask, \
-            self.limiter_core_mask, self.flag_limiter = self.Jtor_build(
-                R, Z, psi, psi_bndry, self.limiter_handler, self.Ip
-            )
+            self.limiter_core_mask, self.flag_limiter = result
+        self.flood_fill_steps = result.flood_fill_steps
         return self.jtor
 
     def Jtor_build(
@@ -749,6 +874,8 @@ class ConstrainPaxisIp:
         psi_bndry: float,
         limiter_handler: Limiter_handler,
         ip: float,
+        core_mask: jax.Array | None = None,
+        psi_axis: jax.Array | None = None,
     ):
         """Universal function that calculates the plasma current distribution,
         common to all of the different types of profile parametrizations used in FreeGSNKE.
@@ -762,8 +889,9 @@ class ConstrainPaxisIp:
             diverted_core_mask,
             limiter_core_mask,
             flag_limiter,
+            flood_fill_steps,
         ) = self._jtor_build_kernel_result(
-            R, Z, psi, psi_bndry, limiter_handler, ip
+            R, Z, psi, psi_bndry, limiter_handler, ip, core_mask, psi_axis
         )
         return Jtor_build_result(
             jtor=jtor,
@@ -773,6 +901,7 @@ class ConstrainPaxisIp:
             diverted_core_mask=diverted_core_mask,
             limiter_core_mask=limiter_core_mask,
             flag_limiter=flag_limiter,
+            flood_fill_steps=flood_fill_steps,
         )
 
     def Jtor_pure(
@@ -800,8 +929,32 @@ class ConstrainPaxisIp:
         psi_bndry: float | None,
         limiter_handler: Limiter_handler,
         ip: float,
+        core_mask: jax.Array | None = None,
+        psi_axis: jax.Array | None = None,
     ):
         """Prepare scalar arguments and call the side-effect-free JIT kernel."""
+
+        if core_mask is not None:
+            max_iterations = psi.shape[0] + psi.shape[1] - 2
+            return _jtor_build_from_core_mask_kernel(
+                R,
+                Z,
+                psi,
+                core_mask.astype(bool),
+                limiter_handler.mask_limiter_cells,
+                limiter_handler.fine_cell_ids,
+                limiter_handler.fine_weights_r,
+                limiter_handler.fine_weights_z,
+                limiter_handler.dRdZ,
+                self.paxis,
+                self.Ip,
+                self.Raxis,
+                self.alpha_m,
+                self.alpha_n,
+                psi[0, 0] if psi_axis is None else jnp.asarray(psi_axis, dtype=psi.dtype),
+                psi[0, 0] if psi_bndry is None else jnp.asarray(psi_bndry, dtype=psi.dtype),
+                max_iterations,
+            )
 
         # ``None`` cannot enter a JIT as an array.  Its original meaning is
         # represented by the current corner flux plus a dynamic selector.
@@ -831,6 +984,7 @@ class ConstrainPaxisIp:
             self.alpha_m,
             self.alpha_n,
             max_iterations,
+            self.los_top_k,
         )
 
     def Jtor_part2(self, R, Z, psi, psi_axis, psi_bndry, mask):
